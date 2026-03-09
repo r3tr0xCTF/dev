@@ -5411,6 +5411,152 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
         return result
 
+    # =========================================================================
+    # JS-TAP XSS C2 TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def jstap_start_server(
+        port: int = 8444,
+        host: str = "0.0.0.0",
+        jstap_dir: str = "",
+        use_gunicorn: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Start the JS-Tap XSS C2 server for red team browser monitoring operations.
+
+        JS-Tap delivers a JavaScript implant (telemlib.js) via XSS or direct
+        file injection to capture credentials, cookies, form data, API calls,
+        and screenshots from target browser sessions.
+
+        Args:
+            port: Port for the JS-Tap server (default: 8444)
+            host: Interface to bind (default: 0.0.0.0)
+            jstap_dir: Custom path to JS-Tap installation (auto-detected if empty)
+            use_gunicorn: Use Gunicorn with SSL if available (recommended)
+
+        Returns:
+            Server PID, portal URL, log path, and startup mode
+        """
+        data = {
+            "port": port,
+            "host": host,
+            "use_gunicorn": use_gunicorn,
+        }
+        if jstap_dir:
+            data["jstap_dir"] = jstap_dir
+
+        logger.info(
+            f"{HexStrikeColors.HACKER_RED}🎣 Starting JS-Tap C2 on {host}:{port}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/jstap/start", data)
+
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ JS-Tap running: PID {result.get('pid')} "
+                f"| {result.get('portal')}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ JS-Tap start failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def jstap_stop_server() -> Dict[str, Any]:
+        """
+        Stop the running JS-Tap XSS C2 server.
+
+        Returns:
+            Confirmation with stopped PID
+        """
+        logger.info(
+            f"{HexStrikeColors.CRIMSON}🛑 Stopping JS-Tap C2 server{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/jstap/stop", {})
+
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {result.get('message', 'JS-Tap stopped')}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Stop failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def jstap_server_status() -> Dict[str, Any]:
+        """
+        Check whether the JS-Tap XSS C2 server is currently running.
+
+        Returns:
+            Running status, PID, port, uptime, and portal URL
+        """
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}📡 Checking JS-Tap server status{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_get("api/tools/jstap/status")
+
+        running = result.get("running", False)
+        if running:
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ JS-Tap running | PID {result.get('pid')} "
+                f"| uptime {result.get('uptime')} | {result.get('portal')}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.info(
+                f"{HexStrikeColors.WARNING}⚠️  JS-Tap is not running{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def jstap_generate_payload(
+        server_url: str = "",
+        mode: str = "trap",
+        custom_js: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Generate JS-Tap XSS payload snippets ready for injection or embedding.
+
+        Provides multiple payload variants (script tag, img onerror, svg onload
+        for trap mode; dynamic import, IIFE, fetch+eval for implant mode).
+
+        Args:
+            server_url: Base URL of the JS-Tap server (e.g. https://10.0.0.1:8444).
+                        Auto-detected from running instance if empty.
+            mode: Delivery mode — 'trap' (XSS + iframe persistence) or
+                  'implant' (embed in existing app JavaScript files)
+            custom_js: Optional extra JavaScript to append after the implant load
+
+        Returns:
+            Dict of payload variants, telemlib.js URL, and usage notes
+        """
+        data: Dict[str, Any] = {"mode": mode}
+        if server_url:
+            data["server_url"] = server_url
+        if custom_js:
+            data["custom_js"] = custom_js
+
+        logger.info(
+            f"{HexStrikeColors.FIRE_RED}🎯 Generating JS-Tap '{mode}' payload"
+            f"{' for ' + server_url if server_url else ' (auto-detect)'}"
+            f"{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/jstap/payload", data)
+
+        if result.get("success"):
+            variants = list(result.get("payloads", {}).keys())
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Generated {len(variants)} payload variants: "
+                f"{', '.join(variants)}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Payload generation failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
     return mcp
 
 def parse_args():

