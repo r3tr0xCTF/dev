@@ -17599,6 +17599,318 @@ def jstap_payload():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ============================================================================
+# TUNNEL MANAGER — expose local C2 via ngrok / cloudflared / serveo / localhost.run
+# ============================================================================
+
+class TunnelManager:
+    """Manages an outbound tunnel to expose a local port to the internet.
+
+    Supports four providers (auto-detected in priority order):
+      1. ngrok         — polls localhost:4040 API for the public URL
+      2. cloudflared   — parses stderr for the trycloudflare.com URL
+      3. serveo        — SSH reverse tunnel via serveo.net (no install)
+      4. localhost.run — SSH reverse tunnel via localhost.run (no install)
+    """
+
+    PROVIDER_PRIORITY = ["ngrok", "cloudflared", "serveo", "localhost.run"]
+
+    def __init__(self):
+        self._process = None
+        self._provider = None
+        self._public_url = None
+        self._local_port = None
+        self._start_time = None
+        self._log_path = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _detect_provider(self) -> Optional[str]:
+        """Return the first available tunnel provider binary."""
+        for p in ["ngrok", "cloudflared"]:
+            if shutil.which(p):
+                return p
+        if shutil.which("ssh"):
+            return "serveo"
+        return None
+
+    def _poll_ngrok_api(self, timeout: int = 15) -> Optional[str]:
+        """Block until ngrok's local REST API returns a public URL."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = requests.get("http://localhost:4040/api/tunnels", timeout=2)
+                tunnels = resp.json().get("tunnels", [])
+                # Prefer https tunnel
+                for t in tunnels:
+                    url = t.get("public_url", "")
+                    if url.startswith("https://"):
+                        return url
+                if tunnels:
+                    return tunnels[0].get("public_url")
+            except Exception:
+                pass
+            time.sleep(1)
+        return None
+
+    def _read_url_from_log(
+        self, log_path: str, pattern: str, timeout: int = 25
+    ) -> Optional[str]:
+        """Poll a log file until a URL matching *pattern* appears."""
+        deadline = time.time() + timeout
+        compiled = re.compile(pattern)
+        while time.time() < deadline:
+            try:
+                with open(log_path, "r", errors="ignore") as fh:
+                    match = compiled.search(fh.read())
+                if match:
+                    return match.group(0)
+            except Exception:
+                pass
+            time.sleep(1)
+        return None
+
+    def _build_cmd(
+        self, provider: str, local_port: int, auth_token: str, region: str
+    ) -> Optional[list]:
+        """Return the subprocess command list for the given provider."""
+        if provider == "ngrok":
+            cmd = ["ngrok", "http", str(local_port), "--log=stdout"]
+            if region:
+                cmd.append(f"--region={region}")
+            return cmd
+        if provider == "cloudflared":
+            return [
+                "cloudflared", "tunnel", "--url",
+                f"http://localhost:{local_port}",
+            ]
+        if provider == "serveo":
+            return [
+                "ssh", "-tt",
+                "-R", f"80:localhost:{local_port}",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=30",
+                "serveo.net",
+            ]
+        if provider == "localhost.run":
+            return [
+                "ssh", "-tt",
+                "-R", f"80:localhost:{local_port}",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=30",
+                "nokey@localhost.run",
+            ]
+        return None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(
+        self,
+        local_port: int,
+        provider: str = "auto",
+        auth_token: str = "",
+        region: str = "",
+    ) -> Dict[str, Any]:
+        """Start a tunnel exposing local_port to the internet."""
+        if self._process and self._process.poll() is None:
+            return {
+                "success": False,
+                "error": "Tunnel already running",
+                "provider": self._provider,
+                "public_url": self._public_url,
+            }
+
+        if provider == "auto":
+            provider = self._detect_provider()
+        if not provider:
+            return {
+                "success": False,
+                "error": (
+                    "No tunnel provider found. "
+                    "Install ngrok (https://ngrok.com) or cloudflared "
+                    "(https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/)."
+                ),
+            }
+
+        # Configure ngrok auth token before launch if supplied
+        if provider == "ngrok" and auth_token:
+            try:
+                subprocess.run(
+                    ["ngrok", "config", "add-authtoken", auth_token],
+                    capture_output=True,
+                    check=True,
+                )
+                logger.info("🔑 ngrok auth token configured")
+            except Exception as e:
+                logger.warning(f"ngrok authtoken config failed: {e}")
+
+        cmd = self._build_cmd(provider, local_port, auth_token, region)
+        if not cmd:
+            return {"success": False, "error": f"Unsupported provider: {provider}"}
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(base_dir, f"tunnel_{provider}.log")
+        self._log_path = log_path
+        self._local_port = local_port
+        self._provider = provider
+
+        try:
+            log_file = open(log_path, "w")
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                stdin=subprocess.DEVNULL,
+            )
+            self._start_time = datetime.now()
+
+            # Brief pause for the process to initialise
+            time.sleep(2)
+            if self._process.poll() is not None:
+                return {
+                    "success": False,
+                    "error": f"{provider} exited immediately. Check {log_path}",
+                }
+
+            # Provider-specific URL extraction
+            url_patterns = {
+                "cloudflared": r"https://[a-z0-9-]+\.trycloudflare\.com",
+                "serveo":       r"https?://[a-z0-9-]+\.serveo\.net",
+                "localhost.run": r"https://[a-z0-9-]+\.lhr\.life",
+            }
+
+            if provider == "ngrok":
+                public_url = self._poll_ngrok_api(timeout=15)
+            else:
+                public_url = self._read_url_from_log(
+                    log_path, url_patterns[provider], timeout=25
+                )
+
+            self._public_url = public_url
+
+            if not public_url:
+                return {
+                    "success": False,
+                    "error": (
+                        f"{provider} started (PID {self._process.pid}) but "
+                        f"public URL not detected. Check {log_path}"
+                    ),
+                    "pid": self._process.pid,
+                }
+
+            logger.info(f"🌐 Tunnel up: {public_url} → localhost:{local_port}")
+            return {
+                "success": True,
+                "provider": provider,
+                "public_url": public_url,
+                "local_port": local_port,
+                "pid": self._process.pid,
+                "log": log_path,
+                "started_at": self._start_time.isoformat(),
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"Failed to start {provider}: {e}"}
+
+    def stop(self) -> Dict[str, Any]:
+        """Terminate the running tunnel process."""
+        if not self._process:
+            return {"success": False, "error": "No tunnel is running"}
+        if self._process.poll() is not None:
+            self._process = None
+            return {"success": True, "message": "Tunnel was already stopped"}
+        pid = self._process.pid
+        try:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
+            self._public_url = None
+            self._start_time = None
+            logger.info(f"🛑 Tunnel (PID {pid}) stopped")
+            return {"success": True, "message": f"Tunnel stopped (PID {pid})"}
+        except Exception as e:
+            return {"success": False, "error": f"Error stopping tunnel: {e}"}
+
+    def status(self) -> Dict[str, Any]:
+        """Return current tunnel status."""
+        if not self._process:
+            return {
+                "running": False,
+                "provider": None,
+                "public_url": None,
+                "local_port": None,
+            }
+        alive = self._process.poll() is None
+        uptime = None
+        if alive and self._start_time:
+            uptime = str(datetime.now() - self._start_time).split(".")[0]
+        return {
+            "running": alive,
+            "provider": self._provider,
+            "public_url": self._public_url if alive else None,
+            "local_port": self._local_port,
+            "pid": self._process.pid if alive else None,
+            "uptime": uptime,
+            "log": self._log_path,
+        }
+
+
+# Global tunnel manager instance
+tunnel_manager = TunnelManager()
+
+
+@app.route("/api/tools/tunnel/start", methods=["POST"])
+def tunnel_start():
+    """Start a tunnel exposing a local port to the internet."""
+    try:
+        params = request.json or {}
+        local_port = int(params.get("local_port", 8444))
+        provider = params.get("provider", "auto")
+        auth_token = params.get("auth_token", "")
+        region = params.get("region", "")
+
+        logger.info(f"🌐 Starting {provider} tunnel → localhost:{local_port}")
+        result = tunnel_manager.start(local_port, provider, auth_token, region)
+
+        if result.get("success"):
+            logger.info(f"✅ Tunnel up: {result.get('public_url')}")
+        else:
+            logger.error(f"❌ Tunnel failed: {result.get('error')}")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 tunnel/start error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/tunnel/stop", methods=["POST"])
+def tunnel_stop():
+    """Stop the running tunnel."""
+    try:
+        logger.info("🛑 Stopping tunnel")
+        result = tunnel_manager.stop()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 tunnel/stop error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+@app.route("/api/tools/tunnel/status", methods=["GET"])
+def tunnel_status_route():
+    """Return tunnel running status and public URL."""
+    try:
+        return jsonify(tunnel_manager.status())
+    except Exception as e:
+        logger.error(f"💥 tunnel/status error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
