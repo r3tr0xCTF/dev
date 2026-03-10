@@ -9575,6 +9575,193 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def findings_store(
+        target: str,
+        scanner: str,
+        findings: List[dict],
+    ) -> dict:
+        """
+        Store scan findings into the persistent HexStrike findings database.
+        Automatically deduplicates by target+scanner+type+evidence hash.
+
+        Args:
+            target: The target URL/domain the findings are from
+            scanner: Scanner name (e.g. 'sqli_scan', 'xss', 'cors_test')
+            findings: List of finding dicts (each should have 'type', 'severity', 'url')
+        """
+        result = make_request("POST", "/api/tools/findings/store", {
+            "target": target, "scanner": scanner, "findings": findings,
+        })
+        lines = [
+            f"💾 Findings stored for {target} [{scanner}]",
+            f"   Added    : {result.get('added', 0)}",
+            f"   Dupes    : {result.get('duplicates_skipped', 0)}",
+        ]
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def findings_search(
+        target: Optional[str] = None,
+        scanner: Optional[str] = None,
+        severity: Optional[str] = None,
+        finding_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict:
+        """
+        Search the HexStrike findings database with optional filters.
+
+        Args:
+            target: Filter by target URL/domain (partial match)
+            scanner: Filter by scanner name (exact)
+            severity: Filter by severity: CRITICAL, HIGH, MEDIUM, LOW, INFO
+            finding_type: Filter by finding type (partial match)
+            limit: Max results to return (default: 100)
+        """
+        result = make_request("POST", "/api/tools/findings/search", {
+            "target": target, "scanner": scanner, "severity": severity,
+            "finding_type": finding_type, "limit": limit,
+        })
+        rows     = result.get("findings", [])
+        critical = sum(1 for r in rows if r.get("severity") == "CRITICAL")
+        high     = sum(1 for r in rows if r.get("severity") == "HIGH")
+        lines    = [
+            f"🔍 Findings Search Results: {result.get('count', 0)} found",
+            f"   Critical: {critical}  High: {high}",
+            "",
+        ]
+        for r in rows[:20]:
+            lines.append(
+                f"   [{r.get('severity','?'):8s}] {r.get('scanner',''):15s} "
+                f"{r.get('finding_type',''):25s} {r.get('url','')[:60]}"
+            )
+        if len(rows) > 20:
+            lines.append(f"   ... and {len(rows)-20} more")
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def findings_export(
+        fmt: str = "json",
+        target: Optional[str] = None,
+        scanner: Optional[str] = None,
+        severity: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> dict:
+        """
+        Export findings from the database as JSON or CSV.
+
+        Args:
+            fmt: Output format — 'json' or 'csv'
+            target: Filter by target (partial match)
+            scanner: Filter by scanner name
+            severity: Filter by severity level
+            output_path: Save to file path (optional — returns content if omitted)
+        """
+        result = make_request("POST", "/api/tools/findings/export", {
+            "format": fmt, "target": target, "scanner": scanner, "severity": severity,
+        })
+        content = result if isinstance(result, str) else str(result)
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return {"output": f"Exported to {output_path} ({len(content)} bytes)", "data": {"path": output_path}}
+        preview = content[:500] + ("..." if len(content) > 500 else "")
+        return {"output": f"Export ({fmt.upper()}):\n{preview}", "data": {"content": content}}
+
+    @mcp.tool()
+    def host_header_inject(
+        target: str,
+        callback_url: Optional[str] = None,
+        run_reset: bool = True,
+        run_cache: bool = True,
+        run_ssrf: bool = True,
+        run_port: bool = True,
+        run_absolute: bool = True,
+    ) -> dict:
+        """
+        Host Header Injection scanner — password reset poisoning, cache poisoning,
+        SSRF via X-Forwarded-Host, port manipulation, absolute URL reflection.
+
+        Args:
+            target: Target base URL
+            callback_url: OOB callback host for SSRF detection (e.g. interactsh URL)
+            run_reset: Test password reset link poisoning
+            run_cache: Test cache poisoning via injected Host header
+            run_ssrf: Test SSRF via X-Forwarded-Host to metadata endpoints
+            run_port: Test internal service discovery via port override
+            run_absolute: Test X-Forwarded-Host + X-Forwarded-Proto reflection
+        """
+        result = make_request("POST", "/api/tools/hostheader/inject", {
+            "target": target, "callback_url": callback_url,
+            "run_reset": run_reset, "run_cache": run_cache,
+            "run_ssrf": run_ssrf, "run_port": run_port, "run_absolute": run_absolute,
+        })
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        medium   = result.get("medium", 0)
+        lines = [
+            f"🌐 Host Header Injection: {target}",
+            f"   Findings : {len(findings)} ({critical} CRITICAL, {high} HIGH, {medium} MEDIUM)",
+            f"   Duration : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+        for f in findings:
+            lines.append(f"   [{f.get('severity','?')}] {f.get('type','?')} via {f.get('header','')} — {f.get('note', f.get('url',''))}")
+        if not findings:
+            lines.append("   No host header injection vulnerabilities found.")
+            lines.append("   → Provide callback_url (e.g. interactsh) for OOB SSRF detection.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🌐 HostHeader: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def report_html(
+        title: str = "HexStrike AI — Engagement Report",
+        target_filter: Optional[str] = None,
+        severity_filter: Optional[str] = None,
+        raw_findings: Optional[List[dict]] = None,
+        output_path: Optional[str] = None,
+    ) -> dict:
+        """
+        Generate a self-contained HTML engagement report from the findings database
+        or raw findings input. Includes severity donut chart, summary cards, and full
+        findings table. Dark-theme, professional layout.
+
+        Args:
+            title: Report title shown at the top of the HTML
+            target_filter: Only include findings for this target (partial match)
+            severity_filter: Only include findings at this severity (CRITICAL/HIGH/etc)
+            raw_findings: Pass findings directly (skips DB lookup) — list of finding dicts
+            output_path: Save HTML to this file path (e.g. /tmp/report.html)
+        """
+        result = make_request("POST", "/api/tools/report/html", {
+            "title": title, "target_filter": target_filter,
+            "severity_filter": severity_filter,
+            "raw_findings": raw_findings,
+            "output_path": output_path,
+        })
+        counts = result.get("counts", {})
+        lines = [
+            f"📊 HTML Report Generated: {title}",
+            f"   Total findings : {result.get('total_findings', 0)}",
+            f"   Critical       : {counts.get('CRITICAL', 0)}",
+            f"   High           : {counts.get('HIGH', 0)}",
+            f"   Medium         : {counts.get('MEDIUM', 0)}",
+            f"   HTML size      : {result.get('html_length', 0):,} bytes",
+        ]
+        if output_path:
+            lines.append(f"   Saved to       : {output_path}")
+        else:
+            lines.append("   → Pass output_path to save to a file.")
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}📊 Report: {result.get('total_findings',0)} findings, "
+            f"{counts.get('CRITICAL',0)} crit{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

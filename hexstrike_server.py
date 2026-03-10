@@ -20652,7 +20652,49 @@ class AutoReconPipeline:
 
     # ── Stage 1: Host Discovery ───────────────────────────────────────────────
 
-    def _discover_hosts(self, domain: str, use_subfinder: bool, use_amass: bool) -> List[str]:
+    def _discover_hosts(self, domain: str, use_subfinder: bool, use_amass: bool,
+                        use_subdomain_enum: bool = False,
+                        subdomain_enum_brute: bool = False,
+                        subdomain_enum_alterations: bool = True) -> List[str]:
+        """
+        Stage 1 host discovery.
+        When use_subdomain_enum=True delegates entirely to SubdomainEnumerator (7-stage pipeline:
+        subfinder + amass + crt.sh + hackertarget + wildcard filter + shuffledns brute +
+        alterations + dnsx + httpx). Falls back to the simpler subfinder/amass/httpx path otherwise.
+        """
+        # ── Enhanced path: full SubdomainEnumerator pipeline ─────────────────
+        if use_subdomain_enum:
+            logger.info(f"AutoRecon[1]: using SubdomainEnumerator 7-stage pipeline on {domain}")
+            try:
+                enum_result = subdomain_enumerator.run(
+                    domain=domain,
+                    run_passive=True,
+                    run_brute=subdomain_enum_brute,
+                    run_alterations=subdomain_enum_alterations,
+                    run_httpx=True,
+                    run_screenshots=False,
+                    threads=100,
+                )
+                live_services = enum_result.get("live_services", [])
+                live_urls = [s["url"] for s in live_services if s.get("url")]
+                if not live_urls:
+                    live_urls = [
+                        f"https://{r['host']}" for r in enum_result.get("resolved", [])
+                        if r.get("alive")
+                    ]
+                logger.info(
+                    f"AutoRecon[1]: SubdomainEnumerator → "
+                    f"{enum_result.get('total_found', 0)} found, "
+                    f"{enum_result.get('total_resolved', 0)} resolved, "
+                    f"{len(live_urls)} live"
+                )
+                if live_urls:
+                    return live_urls
+                logger.warning("AutoRecon[1]: SubdomainEnumerator returned no live hosts — falling back")
+            except Exception as e:
+                logger.error(f"AutoRecon[1]: SubdomainEnumerator error: {e} — falling back")
+
+        # ── Standard path: subfinder + amass + httpx ─────────────────────────
         subdomains: set = {domain}
 
         if use_subfinder:
@@ -20770,6 +20812,9 @@ class AutoReconPipeline:
         domain: str,
         use_subfinder: bool = True,
         use_amass: bool = False,
+        use_subdomain_enum: bool = False,
+        subdomain_enum_brute: bool = False,
+        subdomain_enum_alterations: bool = True,
         js_secret_depth: int = 2,
         run_xss_pipeline: bool = True,
         tunnel_provider: str = "auto",
@@ -20785,11 +20830,16 @@ class AutoReconPipeline:
         _start   = time.time()
         stages: Dict[str, Any] = {}
 
-        logger.info(f"🚀 AutoRecon starting → {domain}  dry_run={dry_run}")
+        logger.info(f"🚀 AutoRecon starting → {domain}  dry_run={dry_run}  subdomain_enum={use_subdomain_enum}")
 
         # ── Stage 1: Host Discovery ──────────────────────────────────────────
         logger.info("AutoRecon[1/5]: Host discovery")
-        live_hosts = self._discover_hosts(domain, use_subfinder, use_amass)
+        live_hosts = self._discover_hosts(
+            domain, use_subfinder, use_amass,
+            use_subdomain_enum=use_subdomain_enum,
+            subdomain_enum_brute=subdomain_enum_brute,
+            subdomain_enum_alterations=subdomain_enum_alterations,
+        )
         stages["discovery"] = {"domain": domain, "live_hosts": live_hosts, "count": len(live_hosts)}
 
         if not live_hosts:
@@ -20974,10 +21024,13 @@ def auto_recon_route():
             domain=params.get("domain", ""),
             use_subfinder=bool(params.get("use_subfinder", True)),
             use_amass=bool(params.get("use_amass", False)),
+            use_subdomain_enum=bool(params.get("use_subdomain_enum", False)),
+            subdomain_enum_brute=bool(params.get("subdomain_enum_brute", False)),
+            subdomain_enum_alterations=bool(params.get("subdomain_enum_alterations", True)),
             js_secret_depth=int(params.get("js_secret_depth", 2)),
             run_xss_pipeline=bool(params.get("run_xss_pipeline", True)),
             tunnel_provider=params.get("tunnel_provider", "auto"),
-            tunnel_auth_token=params.get("tunnel_auth_token", ""   ),
+            tunnel_auth_token=params.get("tunnel_auth_token", ""),
             jstap_port=int(params.get("jstap_port", 8444)),
             jstap_username=params.get("jstap_username", ""),
             jstap_password=params.get("jstap_password", ""),
@@ -27837,6 +27890,639 @@ def saml_attack_route():
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 saml/attack error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINDINGS DATABASE
+# ─────────────────────────────────────────────────────────────────────────────
+import sqlite3
+import hashlib
+import csv
+import io as _io
+
+class FindingsDB:
+    """
+    Persistent SQLite store for all scan findings.
+    Supports deduplication, search by severity/type/target, and JSON/CSV export.
+    DB lives at <tempdir>/hexstrike_findings.db
+    """
+
+    DB_PATH = str(Path(tempfile.gettempdir()) / "hexstrike_findings.db")
+
+    def __init__(self):
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS findings (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    hash        TEXT    UNIQUE,
+                    target      TEXT    NOT NULL,
+                    scanner     TEXT    NOT NULL,
+                    finding_type TEXT   NOT NULL,
+                    severity    TEXT    NOT NULL,
+                    title       TEXT,
+                    detail      TEXT,
+                    evidence    TEXT,
+                    url         TEXT,
+                    param       TEXT,
+                    payload     TEXT,
+                    raw_json    TEXT,
+                    created_at  TEXT    DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_severity ON findings(severity)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_target   ON findings(target)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_scanner  ON findings(scanner)")
+            conn.commit()
+
+    def _make_hash(self, target: str, scanner: str, finding_type: str, evidence: str) -> str:
+        raw = f"{target}|{scanner}|{finding_type}|{evidence}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def store(self, target: str, scanner: str, findings: List[Dict]) -> Dict:
+        """Store a list of findings from any scanner. Deduplicates by hash."""
+        added = 0
+        dupes = 0
+        with self._conn() as conn:
+            for f in findings:
+                ftype    = f.get("type", "unknown")
+                severity = f.get("severity", "INFO")
+                evidence = f.get("evidence", f.get("payload", f.get("note", "")))
+                url      = f.get("url", target)
+                h = self._make_hash(target, scanner, ftype, evidence)
+                try:
+                    conn.execute("""
+                        INSERT INTO findings
+                            (hash, target, scanner, finding_type, severity, title,
+                             detail, evidence, url, param, payload, raw_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        h, target, scanner, ftype, severity,
+                        f.get("title", ftype),
+                        f.get("note", f.get("detail", "")),
+                        str(evidence)[:500],
+                        url,
+                        f.get("param", ""),
+                        str(f.get("payload", ""))[:500],
+                        json.dumps(f),
+                    ))
+                    added += 1
+                except sqlite3.IntegrityError:
+                    dupes += 1
+            conn.commit()
+        return {"added": added, "duplicates_skipped": dupes, "total": added + dupes}
+
+    def search(self, target: Optional[str] = None, scanner: Optional[str] = None,
+               severity: Optional[str] = None, finding_type: Optional[str] = None,
+               limit: int = 200) -> List[Dict]:
+        """Search findings with optional filters."""
+        clauses = []
+        params  = []
+        if target:
+            clauses.append("target LIKE ?")
+            params.append(f"%{target}%")
+        if scanner:
+            clauses.append("scanner = ?")
+            params.append(scanner)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity.upper())
+        if finding_type:
+            clauses.append("finding_type LIKE ?")
+            params.append(f"%{finding_type}%")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM findings {where} ORDER BY created_at DESC LIMIT ?",
+                params + [limit]
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def export(self, fmt: str = "json", **search_kwargs) -> str:
+        """Export findings as JSON or CSV string."""
+        rows = self.search(**search_kwargs)
+        if fmt == "csv":
+            if not rows:
+                return "id,target,scanner,finding_type,severity,title,url,param,payload,created_at\n"
+            buf = _io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["id","target","scanner","finding_type",
+                                                      "severity","title","url","param","payload","created_at"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in writer.fieldnames})
+            return buf.getvalue()
+        return json.dumps(rows, indent=2)
+
+    def stats(self) -> Dict:
+        with self._conn() as conn:
+            total    = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+            by_sev   = {r[0]: r[1] for r in conn.execute("SELECT severity, COUNT(*) FROM findings GROUP BY severity")}
+            by_scan  = {r[0]: r[1] for r in conn.execute("SELECT scanner, COUNT(*) FROM findings GROUP BY scanner")}
+            critical = by_sev.get("CRITICAL", 0)
+            high     = by_sev.get("HIGH", 0)
+        return {"total": total, "critical": critical, "high": high,
+                "by_severity": by_sev, "by_scanner": by_scan, "db_path": self.DB_PATH}
+
+    def clear(self, target: Optional[str] = None) -> Dict:
+        with self._conn() as conn:
+            if target:
+                conn.execute("DELETE FROM findings WHERE target LIKE ?", (f"%{target}%",))
+            else:
+                conn.execute("DELETE FROM findings")
+            conn.commit()
+        return {"cleared": True, "target_filter": target}
+
+
+findings_db = FindingsDB()
+
+
+@app.route("/api/tools/findings/store", methods=["POST"])
+def findings_store_route():
+    try:
+        data = request.get_json() or {}
+        result = findings_db.store(
+            target=data.get("target", ""),
+            scanner=data.get("scanner", "manual"),
+            findings=data.get("findings", []),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 findings/store error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tools/findings/search", methods=["POST"])
+def findings_search_route():
+    try:
+        data = request.get_json() or {}
+        rows = findings_db.search(
+            target=data.get("target"),
+            scanner=data.get("scanner"),
+            severity=data.get("severity"),
+            finding_type=data.get("finding_type"),
+            limit=data.get("limit", 200),
+        )
+        return jsonify({"findings": rows, "count": len(rows)})
+    except Exception as e:
+        logger.error(f"💥 findings/search error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tools/findings/export", methods=["POST"])
+def findings_export_route():
+    try:
+        data  = request.get_json() or {}
+        fmt   = data.get("format", "json")
+        out   = findings_db.export(
+            fmt=fmt,
+            target=data.get("target"),
+            scanner=data.get("scanner"),
+            severity=data.get("severity"),
+        )
+        ct = "text/csv" if fmt == "csv" else "application/json"
+        return app.response_class(out, mimetype=ct)
+    except Exception as e:
+        logger.error(f"💥 findings/export error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tools/findings/stats", methods=["GET"])
+def findings_stats_route():
+    try:
+        return jsonify(findings_db.stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tools/findings/clear", methods=["POST"])
+def findings_clear_route():
+    try:
+        data = request.get_json() or {}
+        return jsonify(findings_db.clear(target=data.get("target")))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOST HEADER INJECTION
+# ─────────────────────────────────────────────────────────────────────────────
+class HostHeaderInjectionScanner:
+    """
+    Password reset poisoning, cache poisoning via Host, SSRF via X-Forwarded-Host,
+    port manipulation, and arbitrary host override detection.
+    """
+
+    INJECT_HEADERS = [
+        "Host", "X-Forwarded-Host", "X-Host", "X-Forwarded-Server",
+        "X-HTTP-Host-Override", "Forwarded", "X-Original-Host",
+    ]
+
+    RESET_PATHS = ["/forgot-password", "/reset-password", "/password-reset",
+                   "/account/reset", "/api/auth/reset", "/users/password",
+                   "/auth/forgot", "/api/reset", "/user/forgot-password"]
+
+    CACHE_PATHS = ["/", "/index.html", "/home", "/api", "/static/main.js"]
+
+    EVIL_HOST  = "evil.attacker.com"
+    EVIL_PORT  = "evil.attacker.com:8443"
+
+    def _inject_header(self, url: str, header: str, value: str, method: str = "GET",
+                        body: Optional[dict] = None) -> requests.Response:
+        hdrs = {header: value, "User-Agent": "Mozilla/5.0"}
+        if method == "POST":
+            return requests.post(url, json=body or {}, headers=hdrs, timeout=10, verify=False, allow_redirects=False)
+        return requests.get(url, headers=hdrs, timeout=10, verify=False, allow_redirects=False)
+
+    def _test_reset_poisoning(self, base_url: str) -> List[Dict]:
+        """Check if password reset link reflects injected Host header."""
+        findings = []
+        for path in self.RESET_PATHS:
+            url = f"{base_url}{path}"
+            try:
+                # Baseline
+                baseline = requests.post(url, json={"email": "test@test.com"}, timeout=8, verify=False)
+                for hdr in ["Host", "X-Forwarded-Host", "X-Host"]:
+                    r = self._inject_header(url, hdr, self.EVIL_HOST, "POST", {"email": "victim@target.com"})
+                    combined = r.text + r.headers.get("Location", "") + r.headers.get("Set-Cookie", "")
+                    if self.EVIL_HOST in combined:
+                        findings.append({
+                            "type": "password_reset_poisoning",
+                            "header": hdr,
+                            "injected": self.EVIL_HOST,
+                            "severity": "CRITICAL",
+                            "url": url,
+                            "note": f"Response reflects {self.EVIL_HOST} — reset link will point to attacker",
+                        })
+            except Exception:
+                pass
+        return findings
+
+    def _test_cache_poisoning(self, base_url: str) -> List[Dict]:
+        """Inject evil Host header and check if response is cached/reflected."""
+        findings = []
+        for path in self.CACHE_PATHS:
+            url = f"{base_url}{path}"
+            try:
+                baseline = requests.get(url, timeout=8, verify=False)
+                for hdr in self.INJECT_HEADERS:
+                    r = self._inject_header(url, hdr, self.EVIL_HOST)
+                    if self.EVIL_HOST in r.text:
+                        findings.append({
+                            "type": "host_header_cache_poisoning",
+                            "header": hdr,
+                            "injected": self.EVIL_HOST,
+                            "severity": "HIGH",
+                            "url": url,
+                            "note": f"Injected host reflected in response body — cacheable poisoning risk",
+                        })
+                    # Check if Location header leaks injected host
+                    if self.EVIL_HOST in r.headers.get("Location", ""):
+                        findings.append({
+                            "type": "host_header_redirect_poison",
+                            "header": hdr,
+                            "severity": "HIGH",
+                            "url": url,
+                        })
+            except Exception:
+                pass
+        return findings
+
+    def _test_ssrf_via_host(self, base_url: str, callback_url: Optional[str] = None) -> List[Dict]:
+        """Use X-Forwarded-Host to trigger SSRF to internal/metadata endpoints."""
+        findings = []
+        ssrf_targets = [
+            "169.254.169.254",        # AWS/GCP metadata
+            "metadata.google.internal",
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+        ]
+        if callback_url:
+            ssrf_targets.insert(0, callback_url.replace("https://", "").replace("http://", ""))
+
+        for target_host in ssrf_targets:
+            for hdr in ["X-Forwarded-Host", "Host", "X-Host"]:
+                try:
+                    r = self._inject_header(base_url, hdr, target_host)
+                    body = r.text.lower()
+                    # Look for metadata response signatures
+                    if any(sig in body for sig in ["ami-id", "instance-id", "computeMetadata",
+                                                    "iam/security-credentials", "latest/meta-data"]):
+                        findings.append({
+                            "type": "ssrf_via_host_header",
+                            "header": hdr,
+                            "target": target_host,
+                            "severity": "CRITICAL",
+                            "url": base_url,
+                            "note": "SSRF to cloud metadata service via Host header injection",
+                        })
+                    elif target_host == callback_url and r.status_code not in [400, 404]:
+                        findings.append({
+                            "type": "host_header_oob_ssrf",
+                            "header": hdr,
+                            "target": target_host,
+                            "severity": "HIGH",
+                            "url": base_url,
+                            "note": "Server made outbound request to injected host — OOB SSRF",
+                        })
+                except Exception:
+                    pass
+        return findings
+
+    def _test_port_override(self, base_url: str) -> List[Dict]:
+        """Inject Host with non-standard port — can bypass auth/WAF or trigger SSRF."""
+        findings = []
+        port_payloads = [
+            f"localhost:8080", f"127.0.0.1:22", f"internal:3306",
+            f"db.internal:5432", f"cache.internal:6379",
+        ]
+        for payload in port_payloads:
+            try:
+                r = self._inject_header(base_url, "Host", payload)
+                if r.status_code == 200 and payload.split(":")[0] in r.text.lower():
+                    findings.append({
+                        "type": "host_header_port_override",
+                        "injected": payload,
+                        "severity": "MEDIUM",
+                        "url": base_url,
+                        "note": "Injected internal host:port reflected — possible internal routing",
+                    })
+            except Exception:
+                pass
+        return findings
+
+    def _test_absolute_url_override(self, base_url: str) -> List[Dict]:
+        """Send request with absolute URL in request line via Host manipulation."""
+        findings = []
+        try:
+            # Test X-Forwarded-Host causing absolute URL reflection
+            r = requests.get(
+                base_url,
+                headers={"X-Forwarded-Host": self.EVIL_HOST, "X-Forwarded-Proto": "https"},
+                timeout=8, verify=False, allow_redirects=False
+            )
+            if self.EVIL_HOST in r.text or self.EVIL_HOST in r.headers.get("Location", ""):
+                findings.append({
+                    "type": "absolute_url_reflection",
+                    "injected_host": self.EVIL_HOST,
+                    "severity": "HIGH",
+                    "url": base_url,
+                    "note": "X-Forwarded-Host + X-Forwarded-Proto reflected in response",
+                })
+        except Exception:
+            pass
+        return findings
+
+    def run(self, target: str, callback_url: Optional[str] = None,
+            run_reset: bool = True, run_cache: bool = True,
+            run_ssrf: bool = True, run_port: bool = True,
+            run_absolute: bool = True) -> Dict:
+        start = time.time()
+        base_url = target.rstrip("/")
+        findings: List[Dict] = []
+
+        if run_reset:    findings.extend(self._test_reset_poisoning(base_url))
+        if run_cache:    findings.extend(self._test_cache_poisoning(base_url))
+        if run_ssrf:     findings.extend(self._test_ssrf_via_host(base_url, callback_url))
+        if run_port:     findings.extend(self._test_port_override(base_url))
+        if run_absolute: findings.extend(self._test_absolute_url_override(base_url))
+
+        critical = sum(1 for f in findings if f.get("severity") == "CRITICAL")
+        high     = sum(1 for f in findings if f.get("severity") == "HIGH")
+        medium   = sum(1 for f in findings if f.get("severity") == "MEDIUM")
+
+        return {
+            "target": target,
+            "findings": findings,
+            "critical": critical,
+            "high": high,
+            "medium": medium,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+host_header_scanner = HostHeaderInjectionScanner()
+
+
+@app.route("/api/tools/hostheader/inject", methods=["POST"])
+def hostheader_inject_route():
+    try:
+        data = request.get_json() or {}
+        result = host_header_scanner.run(
+            target=data.get("target", ""),
+            callback_url=data.get("callback_url"),
+            run_reset=data.get("run_reset", True),
+            run_cache=data.get("run_cache", True),
+            run_ssrf=data.get("run_ssrf", True),
+            run_port=data.get("run_port", True),
+            run_absolute=data.get("run_absolute", True),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 hostheader/inject error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML REPORT GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+class HTMLReportGenerator:
+    """
+    Generates a self-contained HTML engagement report from findings_db or raw findings input.
+    Includes severity donut chart (Chart.js CDN), findings table, and per-scanner breakdown.
+    """
+
+    SEVERITY_COLORS = {
+        "CRITICAL": "#dc2626",
+        "HIGH":     "#ea580c",
+        "MEDIUM":   "#d97706",
+        "LOW":      "#65a30d",
+        "INFO":     "#0891b2",
+    }
+
+    def _severity_badge(self, sev: str) -> str:
+        color = self.SEVERITY_COLORS.get(sev.upper(), "#6b7280")
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold">{sev}</span>'
+
+    def generate(self, title: str = "HexStrike AI — Engagement Report",
+                 target_filter: Optional[str] = None,
+                 severity_filter: Optional[str] = None,
+                 raw_findings: Optional[List[Dict]] = None,
+                 output_path: Optional[str] = None) -> Dict:
+        """
+        Generate HTML report.
+        Uses raw_findings if provided, otherwise pulls from findings_db.
+        Saves to output_path if given, otherwise returns HTML as string.
+        """
+        start = time.time()
+
+        if raw_findings is not None:
+            rows = raw_findings
+        else:
+            rows = findings_db.search(
+                target=target_filter,
+                severity=severity_filter,
+                limit=2000,
+            )
+
+        # Count by severity
+        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for r in rows:
+            sev = (r.get("severity") or "INFO").upper()
+            counts[sev] = counts.get(sev, 0) + 1
+
+        # Build findings table rows
+        table_rows = ""
+        for r in rows:
+            sev     = (r.get("severity") or "INFO").upper()
+            scanner = r.get("scanner", "")
+            ftype   = r.get("finding_type", r.get("type", ""))
+            url     = r.get("url", r.get("target", ""))
+            param   = r.get("param", "")
+            payload = str(r.get("payload", ""))[:80]
+            note    = r.get("detail", r.get("note", r.get("evidence", "")))[:120]
+            created = r.get("created_at", "")
+            table_rows += f"""
+            <tr>
+              <td>{self._severity_badge(sev)}</td>
+              <td><code>{scanner}</code></td>
+              <td>{ftype}</td>
+              <td style="word-break:break-all;max-width:250px"><a href="{url}" target="_blank">{url[:80]}</a></td>
+              <td><code>{param}</code></td>
+              <td style="font-size:11px;color:#6b7280">{note}</td>
+              <td style="font-size:11px">{created[:16]}</td>
+            </tr>"""
+
+        chart_labels = list(counts.keys())
+        chart_data   = list(counts.values())
+        chart_colors = [self.SEVERITY_COLORS[k] for k in chart_labels]
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }}
+    h1 {{ color: #f8fafc; font-size: 28px; margin-bottom: 4px; }}
+    .subtitle {{ color: #94a3b8; font-size: 14px; margin-bottom: 32px; }}
+    .cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }}
+    .card {{ background: #1e293b; border-radius: 12px; padding: 20px 28px; min-width: 140px; border: 1px solid #334155; }}
+    .card .num {{ font-size: 36px; font-weight: 800; }}
+    .card .lbl {{ font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }}
+    .card.critical .num {{ color: #dc2626; }}
+    .card.high     .num {{ color: #ea580c; }}
+    .card.medium   .num {{ color: #d97706; }}
+    .card.low      .num {{ color: #65a30d; }}
+    .card.total    .num {{ color: #818cf8; }}
+    .section {{ background: #1e293b; border-radius: 12px; padding: 24px; margin-bottom: 24px; border: 1px solid #334155; }}
+    .section h2 {{ font-size: 18px; margin-bottom: 16px; color: #f1f5f9; }}
+    .chart-wrap {{ max-width: 320px; margin: 0 auto; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th {{ background: #0f172a; color: #94a3b8; text-align: left; padding: 10px 12px; border-bottom: 1px solid #334155; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }}
+    td {{ padding: 10px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }}
+    tr:hover td {{ background: #0f172a; }}
+    code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #a5f3fc; }}
+    a {{ color: #60a5fa; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .footer {{ text-align: center; color: #475569; font-size: 12px; margin-top: 32px; }}
+  </style>
+</head>
+<body>
+  <h1>&#x1F5E1;&#xFE0F; {title}</h1>
+  <p class="subtitle">Generated by HexStrike AI &bull; {len(rows)} total findings</p>
+
+  <div class="cards">
+    <div class="card total"><div class="num">{len(rows)}</div><div class="lbl">Total</div></div>
+    <div class="card critical"><div class="num">{counts['CRITICAL']}</div><div class="lbl">Critical</div></div>
+    <div class="card high"><div class="num">{counts['HIGH']}</div><div class="lbl">High</div></div>
+    <div class="card medium"><div class="num">{counts['MEDIUM']}</div><div class="lbl">Medium</div></div>
+    <div class="card low"><div class="num">{counts['LOW'] + counts['INFO']}</div><div class="lbl">Low / Info</div></div>
+  </div>
+
+  <div class="section" style="display:flex;gap:32px;align-items:center;flex-wrap:wrap">
+    <div>
+      <h2>Severity Distribution</h2>
+      <div class="chart-wrap"><canvas id="sevChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>All Findings ({len(rows)})</h2>
+    <div style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>Severity</th><th>Scanner</th><th>Type</th>
+        <th>URL</th><th>Param</th><th>Note</th><th>Found</th>
+      </tr></thead>
+      <tbody>{table_rows}</tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="footer">HexStrike AI &mdash; For authorized security testing only</div>
+
+  <script>
+    new Chart(document.getElementById('sevChart'), {{
+      type: 'doughnut',
+      data: {{
+        labels: {json.dumps(chart_labels)},
+        datasets: [{{ data: {json.dumps(chart_data)}, backgroundColor: {json.dumps(chart_colors)}, borderWidth: 2, borderColor: '#1e293b' }}]
+      }},
+      options: {{ plugins: {{ legend: {{ labels: {{ color: '#e2e8f0' }} }} }}, cutout: '65%' }}
+    }});
+  </script>
+</body>
+</html>"""
+
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+        return {
+            "html": html,
+            "total_findings": len(rows),
+            "counts": counts,
+            "output_path": output_path,
+            "duration_sec": round(time.time() - start, 2),
+        }
+
+
+html_reporter = HTMLReportGenerator()
+
+
+@app.route("/api/tools/report/html", methods=["POST"])
+def report_html_route():
+    try:
+        data = request.get_json() or {}
+        result = html_reporter.generate(
+            title=data.get("title", "HexStrike AI — Engagement Report"),
+            target_filter=data.get("target_filter"),
+            severity_filter=data.get("severity_filter"),
+            raw_findings=data.get("raw_findings"),
+            output_path=data.get("output_path"),
+        )
+        # Don't return full HTML in JSON by default — just metadata + path
+        return jsonify({
+            "total_findings": result["total_findings"],
+            "counts":         result["counts"],
+            "output_path":    result["output_path"],
+            "duration_sec":   result["duration_sec"],
+            "html_length":    len(result["html"]),
+        })
+    except Exception as e:
+        logger.error(f"💥 report/html error: {e}")
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
