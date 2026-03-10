@@ -8504,6 +8504,436 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def http_smuggle(
+        target:       str,
+        probe_cl_te:  bool = True,
+        probe_te_cl:  bool = True,
+        probe_te_te:  bool = True,
+        probe_h2:     bool = True,
+        probe_timing: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        HTTP Request Smuggling detection — 5 desync techniques using raw sockets.
+
+        Probe 1 — CL.TE (probe_cl_te):
+          Front-end honours Content-Length; back-end honours Transfer-Encoding.
+          Sends POST with CL=13 and TE: chunked. The chunk stream ends early (0-terminator)
+          leaving "SMUGGLED" in the back-end's buffer. A follow-up innocent GET
+          then picks up the smuggled prefix, triggering a 400/500 or unexpected status.
+
+        Probe 2 — TE.CL (probe_te_cl):
+          Front-end honours Transfer-Encoding; back-end honours Content-Length.
+          Sends a chunked body with CL=3. Back-end reads only 3 bytes and stalls
+          waiting for the remainder. Detected via socket timeout (>6s).
+
+        Probe 3 — TE.TE Obfuscation (probe_te_te):
+          Both endpoints support TE but one ignores an obfuscated variant.
+          Tests 12 Transfer-Encoding obfuscations:
+            Chunked · CHUNKED · nOnE · chunked,chunked · x,chunked
+            leading-space · tab-prefix · \\x0b · \\x0c · xchunked
+            [chunked] · "chunked"
+          Sends a smuggled GPOST in the chunk payload. Stops at first positive signal.
+
+        Probe 4 — H2 Downgrade (probe_h2):
+          Checks for HTTP/2 upgrade support (101 Upgrade response to h2c).
+          Inspects Alt-Svc header for h2/h3 advertisement.
+          Tests if server accepts ambiguous CL+TE headers simultaneously —
+          forwards both downstream signals H2.CL/H2.TE risk.
+
+        Probe 5 — Timing-Based Blind (probe_timing):
+          Compares baseline GET timing against a TE:chunked + CL:6 probe.
+          If the probe times out (back-end waiting for 6 bytes that don't arrive)
+          the delay confirms back-end CL consumption — reliable blind detection.
+
+        Detection logic:
+          Each probe uses raw sockets to bypass Python's http.client normalisation
+          (which would strip conflicting headers). Signals: HTTP 400/500 on
+          follow-up request, socket timeout, or status change vs baseline.
+
+        Args:
+            target:       Target URL (e.g. https://example.com)
+            probe_cl_te:  Run CL.TE desync probe (default True)
+            probe_te_cl:  Run TE.CL desync probe (default True)
+            probe_te_te:  Run TE.TE obfuscation probe, 12 variants (default True)
+            probe_h2:     Run HTTP/2 downgrade checks (default True)
+            probe_timing: Run timing-based blind probe (default True)
+
+        Returns:
+            Per-technique results with timing, status codes, likely_vuln flag,
+            and CRITICAL/HIGH severity findings.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/smuggle/probe",
+            json={
+                "target":       target,
+                "probe_cl_te":  probe_cl_te,
+                "probe_te_cl":  probe_te_cl,
+                "probe_te_te":  probe_te_te,
+                "probe_h2":     probe_h2,
+                "probe_timing": probe_timing,
+            },
+            timeout=120,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+
+        lines = [
+            f"🚇 HTTP Request Smuggling — {target}",
+            f"   🚨 CRITICAL : {critical}",
+            f"   🔴 HIGH     : {high}",
+            f"   Findings    : {result.get('total_findings', 0)}",
+            f"   ⏱  Duration : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        tech_emoji = {"CL.TE": "📦", "TE.CL": "📬", "TE.TE": "🔀", "H2 downgrade": "⬆️", "timing_blind": "⏱"}
+
+        results_map = result.get("results", {})
+        for key, probe in results_map.items():
+            # te_te is a list
+            probes = probe if isinstance(probe, list) else [probe]
+            for p in probes:
+                tech  = p.get("technique", key)
+                vuln  = p.get("likely_vuln", False)
+                icon  = tech_emoji.get(tech, "🔍")
+                emoji = "🚨" if p.get("severity") == "CRITICAL" else ("🔴" if p.get("severity") == "HIGH" else "✅")
+                lines.append(f"  {emoji} {icon} {tech}")
+                if p.get("status") or p.get("status1"):
+                    lines.append(f"       Status  : {p.get('status', p.get('status1','?'))} → {p.get('status2','–')}")
+                if p.get("timing_sec"):
+                    lines.append(f"       Timing  : {p.get('timing_sec')}s")
+                if p.get("delay_sec"):
+                    lines.append(f"       Delay   : {p.get('delay_sec')}s vs baseline {p.get('baseline_sec')}s")
+                if vuln:
+                    lines.append(f"       ⚠️  {p.get('detail', 'Likely vulnerable')}")
+                if p.get("issues"):
+                    for i in p["issues"]:
+                        lines.append(f"       • [{i.get('severity','?')}] {i.get('issue','')}")
+                lines.append("")
+
+        if not findings:
+            lines.append("✅ No request smuggling signals detected.")
+            lines.append("   → Try against a CDN/load-balanced target with different front-end/back-end stacks.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🚇 Smuggling: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def biz_logic_fuzz(
+        target:           str,
+        endpoints:        Optional[List[str]] = None,
+        check_price:      bool = True,
+        check_qty:        bool = True,
+        check_coupon:     bool = True,
+        check_workflow:   bool = True,
+        check_race:       bool = True,
+        check_pollution:  bool = True,
+        check_hidden:     bool = True,
+        check_mass:       bool = True,
+        race_concurrency: int  = 20,
+    ) -> Dict[str, Any]:
+        """
+        Business logic vulnerability fuzzer — 8 attack categories.
+
+        Check 1 — Price/Amount Tampering (check_price):
+          Injects 11 malicious values into 11 price-related parameter names:
+            0 · -1 · -100 · 0.001 · 0.00 · 1e-10 · 999999999 · -999 · null · NaN · undefined
+          Targets: price, amount, cost, total, subtotal, fee, unit_price, sale_price,
+          discount, tax, grand_total. Detects success keywords in 200/201 responses.
+          CRITICAL severity (complete financial bypass).
+
+        Check 2 — Negative Quantity (check_qty):
+          Tests -1, -999, -0.5, 0, -2147483648 (INT_MIN), 4294967295 (UINT_MAX) against
+          qty, quantity, count, num, amount, units, items, stock, number.
+          Negative quantities can cause price credit, inventory corruption, or free items.
+
+        Check 3 — Coupon/Promo Abuse (check_coupon):
+          Tests SAVE100, DISCOUNT100, FREE, 100OFF, ADMIN, DEBUG, overflow (256xA),
+          SQL injection, and XSS probes in 9 coupon param names.
+          Compares against invalid-coupon baseline to detect false accepts.
+
+        Check 4 — Workflow Skipping (check_workflow):
+          Directly accesses 10 late-stage endpoints without completing earlier steps:
+            /checkout · /payment · /confirm · /complete · /order · /purchase
+            /process · /finalize · /submit · /review
+          Flags 200 responses that don't redirect to login/cart.
+
+        Check 5 — Race Condition (check_race):
+          Fires N=race_concurrency (default 20) concurrent identical POST requests
+          in parallel threads. If >1 returns a success response the endpoint
+          is vulnerable to double-spend/double-redemption attacks.
+
+        Check 6 — Parameter Pollution (check_pollution):
+          Sends duplicate parameters with conflicting values (price: ["999","0.01"],
+          role: ["user","admin"]) as JSON arrays and as duplicate query strings.
+          Tests which value the application processes.
+
+        Check 7 — Hidden Parameter Discovery (check_hidden):
+          Injects 8 common hidden/debug params (debug, test, admin, override,
+          bypass, is_admin, dev, role) with truthy values as both query params
+          and JSON body fields. Flags any response status change.
+
+        Check 8 — Mass Assignment (check_mass):
+          Sends 10 privilege-escalation payloads in create/update requests:
+            role:admin · is_admin:true · admin:true · privilege:superuser
+            is_staff:true · is_superuser:true · access_level:99 · tier:enterprise
+            permissions:["admin","superuser"]
+          Flags responses that echo back the injected field value.
+
+        Args:
+            target:           Target base URL (e.g. https://shop.example.com)
+            endpoints:        Specific API paths to test (default: 10 common checkout paths)
+            check_price:      Test price/amount tampering (default True)
+            check_qty:        Test negative/zero quantities (default True)
+            check_coupon:     Test coupon/promo abuse (default True)
+            check_workflow:   Test workflow step skipping (default True)
+            check_race:       Test race conditions with concurrent requests (default True)
+            check_pollution:  Test HTTP parameter pollution (default True)
+            check_hidden:     Test hidden/debug parameter injection (default True)
+            check_mass:       Test mass assignment privilege escalation (default True)
+            race_concurrency: Number of concurrent threads for race test (default 20)
+
+        Returns:
+            All findings with severity, endpoint, param/value, and response snippets.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/bizlogic/fuzz",
+            json={
+                "target":           target,
+                "endpoints":        endpoints,
+                "check_price":      check_price,
+                "check_qty":        check_qty,
+                "check_coupon":     check_coupon,
+                "check_workflow":   check_workflow,
+                "check_race":       check_race,
+                "check_pollution":  check_pollution,
+                "check_hidden":     check_hidden,
+                "check_mass":       check_mass,
+                "race_concurrency": race_concurrency,
+            },
+            timeout=600,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        medium   = result.get("medium", 0)
+
+        lines = [
+            f"🎯 Business Logic Fuzzer — {target}",
+            f"   Endpoints tested: {len(result.get('endpoints', []))}",
+            f"   🚨 CRITICAL     : {critical}",
+            f"   🔴 HIGH         : {high}",
+            f"   🟡 MEDIUM       : {medium}",
+            f"   ⏱  Duration     : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        type_emoji = {
+            "price_tampering":    "💰",
+            "negative_quantity":  "📉",
+            "coupon_abuse":       "🎟️",
+            "workflow_skip":      "⏭️",
+            "race_condition":     "🏁",
+            "parameter_pollution":"🔀",
+            "hidden_param":       "👁️",
+            "mass_assignment":    "🎭",
+        }
+
+        if findings:
+            lines.append(f"🚨 FINDINGS ({len(findings)}):")
+            for f in findings:
+                sev   = f.get("severity", "MEDIUM")
+                emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡"}.get(sev, "ℹ️")
+                ttype = f.get("type", "?")
+                ticon = type_emoji.get(ttype, "🔍")
+                lines.append(f"  {emoji} [{sev}] {ticon} {ttype.replace('_',' ').title()}")
+                lines.append(f"       URL    : {f.get('url','')[:80]}")
+                if f.get("param"):
+                    lines.append(f"       Param  : {f['param']} = {f.get('value','?')}")
+                if f.get("payload"):
+                    lines.append(f"       Payload: {f.get('payload')}")
+                if f.get("accepted_count"):
+                    lines.append(f"       Race   : {f['accepted_count']}/{f.get('concurrent','?')} concurrent requests accepted")
+                lines.append(f"       Detail : {f.get('detail','')}")
+                if f.get("snippet"):
+                    lines.append(f"       Snippet: {f['snippet'][:100]}")
+                lines.append("")
+        else:
+            lines.append("✅ No business logic issues found with default checks.")
+            lines.append("   → Provide application-specific endpoints and test with authenticated session cookies.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🎯 BizLogic: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def websocket_test(
+        target:          str,
+        ws_url:          str  = "",
+        check_discovery: bool = True,
+        check_auth:      bool = True,
+        check_origin:    bool = True,
+        check_cswsh:     bool = True,
+        check_injection: bool = True,
+        check_subproto:  bool = True,
+    ) -> Dict[str, Any]:
+        """
+        WebSocket security assessment — 6 attack categories.
+
+        Check 1 — Endpoint Discovery (check_discovery):
+          Probes 17 common WebSocket paths via raw HTTP Upgrade handshake:
+            /ws · /websocket · /socket · /socket.io/ · /ws/chat
+            /ws/notifications · /api/ws · /realtime · /live · /stream
+            /feed · /cable (Rails ActionCable) · /sockjs/ · /ws/graphql · + more
+          Tests both wss:// and ws:// schemes. Returns all endpoints accepting 101.
+
+        Check 2 — Auth Bypass (check_auth):
+          Attempts WS upgrade with 6 auth variants:
+            No Authorization header · empty Bearer token · invalid JWT
+            null token · expired alg:none token
+            token in Sec-WebSocket-Protocol subprotocol field
+          CRITICAL severity if any variant gets 101 Switching Protocols.
+
+        Check 3 — Origin Validation (check_origin):
+          Tests WS upgrade from 4 untrusted origins:
+            https://attacker.com · null · evil.{target_domain} · no Origin header
+          HIGH severity if any untrusted origin is accepted → CSWSH prerequisite.
+
+        Check 4 — CSWSH PoC Generation (check_cswsh):
+          Generates a ready-to-use Cross-Site WebSocket Hijacking HTML PoC page.
+          The page auto-connects using the victim's session cookies and exfiltrates
+          all received WS messages to attacker.com/collect.
+
+        Check 5 — Message Injection (check_injection):
+          Establishes a real WS connection and sends 6 injection payloads:
+            XSS: <script>alert(1)</script> · <img src=x onerror=...>
+            SQLi: SELECT * FROM users · 1 OR 1=1
+            OS command: ls -la · id
+            Template injection: {{7*7}} · ${7*7}
+            Prototype pollution: {"__proto__":{"admin":true}}
+            Path traversal: ../../etc/passwd
+          Flags reflection of injected content in server response frames.
+
+        Check 6 — Subprotocol Abuse (check_subproto):
+          Tests 8 unusual Sec-WebSocket-Protocol values:
+            admin · debug · internal · superuser · bypass · chat,admin · v1,admin · raw
+          Flags acceptance of privilege-indicating protocols.
+
+        Args:
+            target:          Target base URL (e.g. https://example.com)
+            ws_url:          Direct WebSocket URL to test (skips discovery if provided)
+            check_discovery: Probe 17 WS endpoint paths (default True)
+            check_auth:      Test auth bypass with 6 variants (default True)
+            check_origin:    Test Origin header validation / CSWSH (default True)
+            check_cswsh:     Generate CSWSH PoC HTML page (default True)
+            check_injection: Send injection payloads over live WS connection (default True)
+            check_subproto:  Test privilege-escalating subprotocols (default True)
+
+        Returns:
+            Discovered WS endpoints, all findings with severity, and CSWSH PoC HTML.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/websocket/test",
+            json={
+                "target":          target,
+                "ws_url":          ws_url,
+                "check_discovery": check_discovery,
+                "check_auth":      check_auth,
+                "check_origin":    check_origin,
+                "check_cswsh":     check_cswsh,
+                "check_injection": check_injection,
+                "check_subproto":  check_subproto,
+            },
+            timeout=120,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        medium   = result.get("medium", 0)
+        ws_found = result.get("ws_found", 0)
+        active   = result.get("active_ws_url", "")
+
+        lines = [
+            f"🔌 WebSocket Tester — {target}",
+            f"   WS endpoints found : {ws_found}",
+            f"   Active WS URL      : {active or 'none found'}",
+            f"   🚨 CRITICAL        : {critical}",
+            f"   🔴 HIGH            : {high}",
+            f"   🟡 MEDIUM          : {medium}",
+            f"   ⏱  Duration        : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        # Discovered endpoints
+        endpoints_list = result.get("results", {}).get("endpoints", [])
+        if endpoints_list:
+            lines.append(f"🔍 WS ENDPOINTS ({len(endpoints_list)}):")
+            for ep in endpoints_list:
+                lines.append(f"   ✅ {ep.get('url','')}  [{ep.get('status','')}]")
+            lines.append("")
+
+        results_map = result.get("results", {})
+
+        # Auth bypass
+        auth = results_map.get("auth_bypass", [])
+        if auth:
+            lines.append(f"🚨 AUTH BYPASS ({len(auth)} variants accepted):")
+            for a in auth:
+                lines.append(f"  🚨 [CRITICAL] variant='{a.get('variant','')}' — {a.get('detail','')}")
+            lines.append("")
+
+        # Origin
+        origin = results_map.get("origin", {})
+        if origin.get("issues"):
+            lines.append("🔴 ORIGIN VALIDATION ISSUES:")
+            for i in origin["issues"]:
+                lines.append(f"  🔴 [HIGH] Origin='{i.get('origin','')}' — {i.get('detail','')}")
+            lines.append("")
+
+        # Injection
+        injections = results_map.get("injection", [])
+        if injections:
+            lines.append(f"🔴 MESSAGE INJECTION ({len(injections)}):")
+            for inj in injections:
+                lines.append(f"  🔴 {inj.get('payload','')[:60]}")
+                lines.append(f"     Reflection: {inj.get('reflection','')[:100]}")
+            lines.append("")
+
+        # Subprotocol
+        subproto = results_map.get("subprotocol", [])
+        if subproto:
+            lines.append(f"🟡 SUBPROTOCOL ABUSE ({len(subproto)}):")
+            for sp in subproto:
+                lines.append(f"  🟡 protocol='{sp.get('protocol','')}' accepted")
+            lines.append("")
+
+        # CSWSH PoC
+        cswsh = results_map.get("cswsh", {})
+        if cswsh.get("poc_html") and (high > 0 or (origin.get("issues"))):
+            lines.append("🎭 CSWSH PoC generated — call with data key 'cswsh.poc_html' to retrieve HTML.")
+            lines.append("")
+
+        if not ws_found and not ws_url:
+            lines.append("❌ No WebSocket endpoints found. Try providing ws_url directly.")
+        elif not findings:
+            lines.append("✅ No WebSocket security issues detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔌 WebSocket: {len(findings)} findings "
+            f"({critical} crit), {ws_found} endpoints on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():
