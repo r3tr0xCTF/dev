@@ -7386,6 +7386,282 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    # ─────────────────────────────────────────────────────────
+    #  SSTI SCANNER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def ssti_scan(
+        target: str,
+        depth: int = 3,
+        use_tplmap: bool = True,
+        try_rce: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Detect Server-Side Template Injection across all major template engines
+        and attempt RCE confirmation via known exploitation payloads.
+
+        Detection probes cover:
+          Jinja2 · Twig · Nunjucks · Pebble · Tornado ({{7*7}} → 49)
+          Freemarker · Mako · Spring-EL · Thymeleaf (${7*7} → 49)
+          Pug · Groovy (#{7*7} → 49)
+          ERB · EJS (<%= 7*7 %> → 49)
+          Smarty ({7*7} → 49)
+          Jinja2 fingerprint: {{7*'7'}} → 7777777 (vs Twig → 49)
+          Razor · Play (@(7*7) → 49)
+
+        RCE confirmation (try_rce=True):
+          Jinja2  — os.popen('id') / file read
+          Twig    — registerUndefinedFilterCallback('system')
+          Freemarker — Execute class instantiation
+          Mako    — __import__('os').popen('id')
+          ERB     — backtick execution
+          Smarty  — {php} block execution
+
+        Args:
+            target:     Target URL (e.g. https://example.com)
+            depth:      katana crawl depth for parameter discovery (default 3)
+            use_tplmap: Also run tplmap if installed (default True)
+            try_rce:    Attempt RCE confirmation on detected injections (default True)
+
+        Returns:
+            Detection findings with engine hints + confirmed RCE findings.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/ssti/scan",
+            json={"target": target, "depth": depth,
+                  "use_tplmap": use_tplmap, "try_rce": try_rce},
+            timeout=600,
+        )
+        result = resp.json()
+
+        lines = [
+            f"🧨 SSTI Scanner — {target}",
+            f"   Params tested  : {result.get('params_tested', 0)}",
+            f"   🔴 Detections  : {result.get('total_findings', 0)}",
+            f"   🚨 RCE confirmed: {result.get('rce_confirmed', 0)}",
+            f"   ⏱  Duration    : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if result.get("rce_findings"):
+            lines.append("🚨 RCE CONFIRMED:")
+            for f in result["rce_findings"]:
+                lines.append(f"  🚨 [CRITICAL] {f.get('engine','?')} — {f.get('url','')[:80]}")
+                lines.append(f"     Param   : {f.get('param','?')}")
+                lines.append(f"     Payload : {f.get('payload','')[:100]}")
+                lines.append(f"     Evidence: {f.get('evidence','')}")
+                lines.append("")
+
+        if result.get("findings"):
+            lines.append("🔴 SSTI DETECTIONS:")
+            for f in result["findings"]:
+                lines.append(f"  🔴 [{f.get('severity','?')}] Engines: {', '.join(f.get('engines', []))}")
+                lines.append(f"     URL    : {f.get('url','')[:80]}")
+                lines.append(f"     Param  : {f.get('param','?')}")
+                lines.append(f"     Payload: {f.get('payload','')}  →  expected '{f.get('expected','')}'")
+                lines.append("")
+
+        if not result.get("findings") and not result.get("rce_findings"):
+            lines.append("✅ No SSTI detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🧨 SSTI: {result.get('total_findings',0)} detections, "
+            f"{result.get('rce_confirmed',0)} RCE on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    # ─────────────────────────────────────────────────────────
+    #  SUBDOMAIN TAKEOVER SCANNER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def subdomain_takeover_scan(
+        domain: str,
+        use_subfinder: bool = True,
+        use_subzy: bool = True,
+        use_nuclei: bool = True,
+        manual_check: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Enumerate subdomains and identify subdomain takeover opportunities
+        by resolving CNAMEs and matching against known vulnerable service
+        fingerprints.
+
+        Detection pipeline:
+          1. subfinder — passive subdomain enumeration
+          2. subzy     — fast bulk takeover checker (if installed)
+          3. nuclei    — takeovers/ template set (if installed)
+          4. Manual    — CNAME resolution + fingerprint matching for 19 services:
+               GitHub Pages · Heroku · Netlify · AWS S3 · Azure Web Apps
+               Azure CloudApp · Shopify · Bitbucket · Ghost · Surge
+               Fastly CDN · Zendesk · Firebase · Tumblr · Squarespace
+               Pantheon · Readme.io · WP Engine · and more
+
+        Severity:
+          CRITICAL — CNAME target unreachable/NXDOMAIN (unclaimed)
+          HIGH     — Error fingerprint confirmed in response
+          MEDIUM   — Suspicious CNAME to known service, HTTP 404/503
+
+        Args:
+            domain:        Target root domain (e.g. example.com — no https://)
+            use_subfinder: Run subfinder for enumeration (default True)
+            use_subzy:     Run subzy bulk checker (default True)
+            use_nuclei:    Run nuclei takeover templates (default True)
+            manual_check:  CNAME resolution + fingerprint matching (default True)
+
+        Returns:
+            All findings with subdomain, CNAME, service, severity, and evidence.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/takeover/scan",
+            json={
+                "domain":        domain,
+                "use_subfinder": use_subfinder,
+                "use_subzy":     use_subzy,
+                "use_nuclei":    use_nuclei,
+                "manual_check":  manual_check,
+            },
+            timeout=600,
+        )
+        result = resp.json()
+
+        lines = [
+            f"🎯 Subdomain Takeover Scanner — {domain}",
+            f"   Subdomains found     : {result.get('subdomains_found', 0)}",
+            f"   🚨 CRITICAL          : {result.get('critical', 0)}",
+            f"   🔴 HIGH              : {result.get('high', 0)}",
+            f"   🟡 MEDIUM            : {result.get('medium', 0)}",
+            f"   ✅ Confirmed takeovers: {result.get('confirmed_takeovers', 0)}",
+            f"   ⏱  Duration          : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        sev_icons = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡"}
+        for f in result.get("findings", []):
+            icon      = sev_icons.get(f.get("severity", ""), "❓")
+            confirmed = "✅ CONFIRMED" if f.get("confirmed") else "⚠️  SUSPECTED"
+            lines.append(f"{icon} [{f['severity']}] {f.get('service','?')}  {confirmed}")
+            lines.append(f"   Subdomain : {f.get('subdomain','')}")
+            if f.get("cname"):
+                lines.append(f"   CNAME     : {f.get('cname','')}")
+            lines.append(f"   Evidence  : {f.get('evidence','')}")
+            if f.get("tool"):
+                lines.append(f"   Tool      : {f.get('tool','')}")
+            lines.append("")
+
+        if not result.get("findings"):
+            lines.append("✅ No subdomain takeover opportunities found.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🎯 Subdomain Takeover: {result.get('total_findings',0)} findings "
+            f"({result.get('confirmed_takeovers',0)} confirmed) on {domain}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    # ─────────────────────────────────────────────────────────
+    #  SSRF SCANNER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def ssrf_scan(
+        target: str,
+        depth: int = 3,
+        callback_url: str = "",
+        test_internal: bool = True,
+        test_blind: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Detect Server-Side Request Forgery via direct internal service probing
+        and blind out-of-band callback detection.
+
+        Direct SSRF targets tested (when test_internal=True):
+          AWS metadata      — http://169.254.169.254/latest/meta-data/
+          GCP metadata      — http://169.254.169.254/computeMetadata/v1/
+          Azure metadata    — http://169.254.169.254/metadata/instance
+          AWS user-data     — http://169.254.169.254/latest/user-data
+          Apache status     — http://127.0.0.1/server-status
+          Redis             — http://127.0.0.1:6379/
+          MongoDB           — http://127.0.0.1:27017/
+          Elasticsearch     — http://127.0.0.1:9200/
+          Docker API        — http://127.0.0.1:2375/v1.24/info
+          Kubernetes API    — http://kubernetes.default.svc/api/
+
+        Blind SSRF (when callback_url provided):
+          Injects unique token URLs into candidate parameters.
+          Monitor your callback listener for HTTP hits containing the token.
+          Use your JS-Tap tunnel URL or interactsh as the callback.
+
+        Also returns 8 IP obfuscation bypass variants for manual testing:
+          Octal · Hex · Short-form · IPv6 · nip.io · localtest.me etc.
+
+        Parameter discovery targets 30+ known SSRF-prone param names:
+          url · uri · href · redirect · src · dest · proxy · fetch · webhook
+          callback · image · avatar · feed · rss · resource · endpoint · etc.
+
+        Args:
+            target:        Target URL (e.g. https://example.com)
+            depth:         katana crawl depth for parameter discovery (default 3)
+            callback_url:  OOB callback URL for blind SSRF (JS-Tap tunnel or interactsh)
+            test_internal: Probe cloud metadata + internal service endpoints (default True)
+            test_blind:    Inject blind callback tokens into params (default True)
+
+        Returns:
+            Direct SSRF findings with service + evidence, blind probe tokens,
+            and bypass variant list for manual testing.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/ssrf/scan",
+            json={
+                "target":        target,
+                "depth":         depth,
+                "callback_url":  callback_url,
+                "test_internal": test_internal,
+                "test_blind":    test_blind,
+            },
+            timeout=600,
+        )
+        result = resp.json()
+
+        lines = [
+            f"🔀 SSRF Scanner — {target}",
+            f"   Params tested  : {result.get('params_tested', 0)}",
+            f"   🚨 CRITICAL    : {result.get('critical', 0)}",
+            f"   ⏱  Duration    : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if result.get("findings"):
+            lines.append("🚨 DIRECT SSRF FINDINGS:")
+            for f in result["findings"]:
+                lines.append(f"  🚨 [CRITICAL] {f.get('service','?')}")
+                lines.append(f"     URL      : {f.get('url','')[:80]}")
+                lines.append(f"     Param    : {f.get('param','?')}")
+                lines.append(f"     Target   : {f.get('ssrf_target','')}")
+                lines.append(f"     Evidence : {f.get('evidence','')}")
+                if f.get("response_snippet"):
+                    lines.append(f"     Response : {f['response_snippet'][:120]}")
+                lines.append("")
+
+        if result.get("blind_probes"):
+            lines.append(f"🔍 BLIND SSRF PROBES SENT ({len(result['blind_probes'])}):")
+            lines.append("   Monitor your callback listener for requests containing these tokens:")
+            for p in result["blind_probes"][:10]:
+                lines.append(f"   Token {p.get('token','?')} → param:{p.get('param','?')} on {p.get('url','')[:60]}")
+            lines.append("")
+
+        if result.get("bypass_variants"):
+            lines.append("🔧 IP BYPASS VARIANTS (for manual testing):")
+            for v in result["bypass_variants"]:
+                lines.append(f"   {v}")
+            lines.append("")
+
+        if not result.get("findings") and not result.get("blind_probes"):
+            lines.append("✅ No direct SSRF found. Try setting callback_url for blind detection.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔀 SSRF: {result.get('total_findings',0)} findings, "
+            f"{len(result.get('blind_probes',[]))} blind probes on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

