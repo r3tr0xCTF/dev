@@ -7836,6 +7836,286 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def cache_poison(
+        target:          str,
+        check_headers:   bool = True,
+        check_fat_get:   bool = True,
+        check_deception: bool = True,
+        check_cloaking:  bool = True,
+        check_vary:      bool = True,
+        check_hop:       bool = True,
+        check_paths:     bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Full web cache poisoning detection suite — 7 attack techniques.
+
+        Technique 1 — Unkeyed Header Injection (check_headers):
+          Probes 20 common unkeyed headers to find headers the cache ignores
+          but the backend reflects into the response:
+            X-Forwarded-Host · X-Host · X-Forwarded-Server · Forwarded
+            X-Forwarded-For · X-Real-IP · X-Originating-IP · True-Client-IP
+            CF-Connecting-IP · X-Forwarded-Proto · X-Forwarded-Scheme
+            X-Original-URL · X-Rewrite-URL · X-HTTP-Method-Override
+            X-Forwarded-Port · + more
+          Uses unique marker + cache-buster per probe to confirm reflection
+          persists in cached responses → CRITICAL if cached, HIGH if reflected only.
+
+        Technique 2 — Fat GET Poisoning (check_fat_get):
+          Sends a GET request with a JSON body. Some caches key on URL only
+          and ignore the body; if the backend reflects the body content the
+          cache will serve the poisoned response to other users.
+
+        Technique 3 — Web Cache Deception (check_deception):
+          Appends static-looking extensions (.css .js .png .jpg .woff etc.)
+          to dynamic endpoints. If the cache stores a 200 response without
+          Cache-Control: no-store/private the endpoint is vulnerable — an
+          attacker can steal authenticated responses (profile pages, tokens).
+
+        Technique 4 — Parameter Cloaking (check_cloaking):
+          Tests URL parameter separator variants (semicolons, encoded &, _=)
+          to smuggle hidden parameters past the cache key while the backend
+          processes them, causing reflected payloads to be cached.
+
+        Technique 5 — Vary Header Analysis (check_vary):
+          Inspects the Vary response header to understand cache key composition.
+          Flags: missing Vary, Vary: User-Agent (per-UA poisoning), Vary: Origin
+          (CORS poisoning), missing Accept-Encoding (cache collision), Vary: *.
+
+        Technique 6 — HOP-by-HOP Header Stripping (check_hop):
+          Lists security-critical headers (Authorization, X-CSRF-Token, Cookie,
+          X-Auth-Token) in the Connection header. Some proxies strip them,
+          causing the backend to serve unauthenticated responses that then get
+          cached and served to authenticated users.
+
+        Technique 7 — Path Confusion (check_paths):
+          Tests path delimiter variants that cause cache/backend disagreement:
+            /path;.js · /path/.. · /path%2F..%2F · /path/./ · /path//
+            /path.json · /path%23ignored
+
+        Args:
+            target:          Target URL (e.g. https://example.com or https://example.com/profile)
+            check_headers:   Test 20 unkeyed header injections (default True)
+            check_fat_get:   Test fat GET body reflection (default True)
+            check_deception: Test web cache deception via static extensions (default True)
+            check_cloaking:  Test parameter cloaking via separator variants (default True)
+            check_vary:      Analyze Vary header composition (default True)
+            check_hop:       Test HOP-by-HOP header stripping (default True)
+            check_paths:     Test path confusion/delimiter variants (default True)
+
+        Returns:
+            All findings with severity (CRITICAL/HIGH/MEDIUM), technique type,
+            poisoned URL, evidence, and cache header snapshot per finding.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/cache/poison",
+            json={
+                "target":          target,
+                "check_headers":   check_headers,
+                "check_fat_get":   check_fat_get,
+                "check_deception": check_deception,
+                "check_cloaking":  check_cloaking,
+                "check_vary":      check_vary,
+                "check_hop":       check_hop,
+                "check_paths":     check_paths,
+            },
+            timeout=300,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        medium   = result.get("medium", 0)
+        vary     = result.get("vary_analysis", {})
+
+        lines = [
+            f"☠️  Cache Poisoning — {target}",
+            f"   🚨 CRITICAL : {critical}",
+            f"   🔴 HIGH     : {high}",
+            f"   🟡 MEDIUM   : {medium}",
+            f"   ⏱  Duration : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if vary.get("vary"):
+            lines.append(f"📋 Vary Header: {vary['vary']}")
+            for issue in vary.get("issues", []):
+                lines.append(f"   ⚠️  {issue}")
+            lines.append("")
+
+        type_emoji = {
+            "unkeyed_header":    "🔑",
+            "fat_get":           "🍔",
+            "web_cache_deception":"🎭",
+            "parameter_cloaking":"🪄",
+            "hop_by_hop":        "🔗",
+            "path_confusion":    "🛤️",
+        }
+
+        if findings:
+            lines.append("🚨 FINDINGS:")
+            for f in findings:
+                sev   = f.get("severity", "INFO")
+                emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡"}.get(sev, "ℹ️")
+                ttype = f.get("type", "?")
+                ticon = type_emoji.get(ttype, "🔍")
+                lines.append(f"  {emoji} [{sev}] {ticon} {ttype.replace('_',' ').title()}")
+                if f.get("header"):
+                    lines.append(f"       Header  : {f['header']}: {f.get('value','')[:60]}")
+                if f.get("url"):
+                    lines.append(f"       URL     : {f['url'][:90]}")
+                lines.append(f"       Detail  : {f.get('detail', '')}")
+                if f.get("cached"):
+                    lines.append(f"       ⚠️  CONFIRMED CACHED — response persists without the header!")
+                ch = f.get("cache_hdrs", {})
+                if ch.get("x_cache") or ch.get("cf_cache_status"):
+                    lines.append(
+                        f"       Cache   : X-Cache={ch.get('x_cache','–')}  "
+                        f"CF={ch.get('cf_cache_status','–')}  Age={ch.get('age','–')}"
+                    )
+                lines.append("")
+        else:
+            lines.append("✅ No cache poisoning vectors detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}☠️  Cache Poison: {len(findings)} findings "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def api_key_bruteforce(
+        target:       str,
+        headers_only: bool  = False,
+        wordlist:     Optional[List[str]] = None,
+        delay:        float = 0.3,
+        bypass_rl:    bool  = True,
+        profile_rl:   bool  = True,
+        spray_params: bool  = True,
+    ) -> Dict[str, Any]:
+        """
+        API key discovery and brute-force — header enumeration, default key
+        spraying, query-param injection, and rate-limit profiling + bypass.
+
+        Stage 1 — Rate-Limit Profiling (profile_rl):
+          Rapidly probes the target to characterise its rate-limiting behaviour:
+          trigger threshold, Retry-After, and detection method (HTTP 429 / body).
+
+        Stage 2 — Header Enumeration:
+          Probes 24 API key headers with a unique marker to identify which
+          headers the server recognises and responds differently to:
+            X-API-Key · Api-Key · Authorization · X-Auth-Token · X-Access-Token
+            X-Token · X-Secret-Key · X-Application-Key · X-Client-Key
+            Ocp-Apim-Subscription-Key (Azure) · X-RapidAPI-Key · DD-API-KEY
+            x-hasura-admin-secret · X-IBM-Client-Id · X-Kong-Consumer · + more
+          Returns which headers cause status or body changes → focuses spray.
+
+        Stage 3 — Key Spraying via Header (unless headers_only):
+          Tests the provided wordlist (or built-in 34 common defaults) across
+          all responsive headers. Built-in defaults include:
+            apikey · secret · admin · changeme · test · demo · 12345
+            sk_test_ · pk_live_ · Bearer test · YOUR_API_KEY · REPLACE_ME · etc.
+          Classifies each response as valid / potential / invalid by comparing:
+            - Status code change from 401/403 → 200
+            - Auth success body patterns (welcome, dashboard, "ok":true, etc.)
+            - Response body size increase (>150% of baseline)
+
+        Stage 4 — Query Parameter Spray (spray_params):
+          Tries keys as query parameters across 14 common param names:
+            api_key · apikey · key · token · access_token · auth_token
+            api_token · secret · app_key · client_id · subscription_key · etc.
+
+        Rate-Limit Bypass (bypass_rl):
+          Rotates User-Agent strings and X-Forwarded-For / X-Real-IP headers
+          between requests to evade per-IP and per-UA rate limiters.
+
+        Args:
+            target:       Target API endpoint (e.g. https://api.example.com/v1/users)
+            headers_only: Only enumerate responsive headers, skip key spraying (default False)
+            wordlist:     Custom list of API keys to test (default: 34 built-in common keys)
+            delay:        Seconds between requests to avoid detection (default 0.3)
+            bypass_rl:    Rotate UA + IP headers to bypass rate limiting (default True)
+            profile_rl:   Profile rate-limit threshold before spraying (default True)
+            spray_params: Also test keys as query parameters (default True)
+
+        Returns:
+            Responsive headers, rate-limit profile, all valid/potential key findings
+            with severity (CRITICAL=valid, HIGH=potential), response snippets.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/apikey/bruteforce",
+            json={
+                "target":       target,
+                "headers_only": headers_only,
+                "wordlist":     wordlist,
+                "delay":        delay,
+                "bypass_rl":    bypass_rl,
+                "profile_rl":   profile_rl,
+                "spray_params": spray_params,
+            },
+            timeout=600,
+        )
+        result   = resp.json()
+        findings = result.get("findings", [])
+        critical = result.get("critical", 0)
+        high     = result.get("high", 0)
+        rl       = result.get("rate_limit", {})
+        resp_hdr = result.get("responsive_headers", [])
+
+        lines = [
+            f"🔑 API Key Bruteforcer — {target}",
+            f"   Baseline status  : {result.get('baseline_status', '?')}",
+            f"   Wordlist size     : {result.get('wordlist_size', 0)}",
+            f"   🚨 CRITICAL (valid): {critical}",
+            f"   🔴 HIGH (potential): {high}",
+            f"   ⏱  Duration       : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if rl:
+            if rl.get("detected"):
+                lines.append(
+                    f"⏱  Rate-Limit Detected: triggers at request #{rl.get('trigger_at','?')} "
+                    f"· type={rl.get('type','?')} · Retry-After={rl.get('retry_after','?')}s"
+                )
+            else:
+                lines.append("✅ No rate-limiting detected during profiling.")
+            lines.append("")
+
+        if resp_hdr:
+            lines.append(f"📋 RESPONSIVE HEADERS ({len(resp_hdr)}) — server reacts to these:")
+            for h in resp_hdr:
+                lines.append(
+                    f"   {h['header']:35s} baseline={h['status_baseline']} → probe={h['status_probe']}"
+                )
+            lines.append("")
+
+        if findings:
+            lines.append("🚨 KEY FINDINGS:")
+            for f in findings:
+                sev   = f.get("severity", "HIGH")
+                emoji = "🚨" if sev == "CRITICAL" else "🔴"
+                cls   = f.get("classification", "?")
+                lines.append(f"  {emoji} [{sev}] {cls.upper()} — Key: '{f.get('key','?')}'")
+                if f.get("header"):
+                    lines.append(f"       Header  : {f['header']}")
+                if f.get("param"):
+                    lines.append(f"       Param   : ?{f['param']}=")
+                lines.append(f"       Status  : {f.get('status','?')}")
+                lines.append(f"       Detail  : {f.get('detail','')}")
+                if f.get("snippet"):
+                    lines.append(f"       Snippet : {f['snippet'][:120]}")
+                lines.append("")
+        else:
+            lines.append("✅ No valid API keys found in default wordlist.")
+            lines.append("   → Try with a custom --wordlist of application-specific keys.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔑 API Key BF: {len(findings)} hits "
+            f"({critical} crit) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():
