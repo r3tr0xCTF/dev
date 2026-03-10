@@ -7196,6 +7196,196 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    # ─────────────────────────────────────────────────────────
+    #  PROTOTYPE POLLUTION SCANNER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def proto_pollution_scan(
+        target: str,
+        depth: int = 3,
+        use_ppfuzz: bool = True,
+        use_ppmap: bool = True,
+        manual_probe: bool = True,
+        try_xss_escalation: bool = True,
+        callback_url: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Detect prototype pollution vulnerabilities and attempt automatic
+        escalation to XSS via known gadget chains.
+
+        Detection methods (all enabled by default):
+          - ppfuzz     — fast Go-based PP fuzzer across all parameterized URLs
+          - ppmap      — Python PP mapper with gadget suggestions
+          - manual probe — injects __proto__[key]=val and checks server-side reflection
+
+        XSS escalation gadgets tried on any vulnerable URL:
+          - Generic innerHTML sink
+          - jQuery srcdoc gadget
+          - AngularJS template pollution
+          - Lodash merge innerHTML
+          - constructor.prototype innerHTML
+          - Vue.js data pollution
+
+        Tip: set callback_url to your JS-Tap telemlib.js tunnel URL to
+        auto-deliver the implant on successful PP→XSS escalation.
+
+        Args:
+            target:             Target URL (e.g. https://example.com)
+            depth:              Crawl depth for URL discovery (default 3)
+            use_ppfuzz:         Run ppfuzz if installed (default True)
+            use_ppmap:          Run ppmap if installed (default True)
+            manual_probe:       HTTP-based reflection probe (default True)
+            try_xss_escalation: Attempt gadget chain escalation (default True)
+            callback_url:       XSS callback/implant URL (JS-Tap telemlib or alert)
+
+        Returns:
+            PP findings + XSS escalation attempts with gadget details.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/pp/scan",
+            json={
+                "target":             target,
+                "depth":              depth,
+                "use_ppfuzz":         use_ppfuzz,
+                "use_ppmap":          use_ppmap,
+                "manual_probe":       manual_probe,
+                "try_xss_escalation": try_xss_escalation,
+                "callback_url":       callback_url,
+            },
+            timeout=600,
+        )
+        result = resp.json()
+
+        lines = [
+            f"☣️  Prototype Pollution Scanner — {target}",
+            f"   URLs tested      : {result.get('urls_tested', 0)}",
+            f"   🔴 PP findings   : {result.get('total_findings', 0)}",
+            f"   🚨 XSS escalations: {result.get('xss_escalations', 0)}",
+            f"   ⏱  Duration      : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        if result.get("findings"):
+            lines.append("🔴 PROTOTYPE POLLUTION FINDINGS:")
+            for f in result["findings"]:
+                lines.append(f"  [{f.get('severity','?')}] {f.get('tool','?')} — {f.get('url','')[:80]}")
+                if f.get("payload"):
+                    lines.append(f"    Payload : {f['payload'][:100]}")
+                if f.get("evidence"):
+                    lines.append(f"    Evidence: {f['evidence']}")
+                if f.get("raw"):
+                    lines.append(f"    Raw     : {f['raw'][:100]}")
+                lines.append("")
+
+        if result.get("escalations"):
+            lines.append("🚨 XSS ESCALATION ATTEMPTS:")
+            for e in result["escalations"]:
+                lines.append(f"  🚨 [{e.get('severity','?')}] {e.get('gadget','?')}  (type: {e.get('type','?')})")
+                lines.append(f"     URL      : {e.get('url','')[:80]}")
+                lines.append(f"     Frameworks: {', '.join(e.get('frameworks',[]))}")
+                lines.append(f"     {e.get('description','')}")
+                lines.append("")
+
+        if not result.get("findings") and not result.get("escalations"):
+            lines.append("✅ No prototype pollution detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}☣️  PP Scan: {result.get('total_findings',0)} findings, "
+            f"{result.get('xss_escalations',0)} XSS escalations on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    # ─────────────────────────────────────────────────────────
+    #  CORS TESTER TOOL
+    # ─────────────────────────────────────────────────────────
+    @mcp.tool()
+    def cors_test(
+        target: str,
+        crawl: bool = True,
+        depth: int = 2,
+        use_corsy: bool = False,
+        custom_origins: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive CORS misconfiguration scanner with ready-to-use PoC snippets.
+
+        Tests 14 origin variants per endpoint including:
+          - Arbitrary evil.com origin
+          - null origin (sandboxed iframe exploitation)
+          - HTTP downgrade of HTTPS target
+          - Subdomain trust (evil.example.com)
+          - Suffix bypass (example.com.evil.com)
+          - Prefix removal (evilexample.com)
+          - Underscore bypass (evil_.example.com)
+          - Test/dev/staging subdomain trust
+          - localhost and 127.0.0.1
+
+        Classifies each finding:
+          CRITICAL — origin reflected + credentials=true  (full data theft)
+          CRITICAL — null origin + credentials=true       (iframe exploit)
+          HIGH     — wildcard + credentials misconfiguration
+          MEDIUM   — origin reflected without credentials
+
+        Generates fetch() PoC exploit code for every CRITICAL finding.
+
+        Args:
+            target:         Target URL (e.g. https://example.com)
+            crawl:          Crawl target with katana to find more endpoints (default True)
+            depth:          Crawl depth (default 2)
+            use_corsy:      Also run corsy if installed (default False)
+            custom_origins: Comma-separated extra origins to test
+
+        Returns:
+            All CORS misconfigs with type, severity, and PoC fetch() snippet.
+        """
+        custom_list = [o.strip() for o in custom_origins.split(",") if o.strip()] if custom_origins else None
+
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/cors/test",
+            json={
+                "target":         target,
+                "crawl":          crawl,
+                "depth":          depth,
+                "use_corsy":      use_corsy,
+                "custom_origins": custom_list,
+            },
+            timeout=300,
+        )
+        result = resp.json()
+
+        lines = [
+            f"🌐 CORS Misconfiguration Tester — {target}",
+            f"   Endpoints tested : {result.get('endpoints_tested', 0)}",
+            f"   Origins tested   : {result.get('origins_tested', 0)}",
+            f"   🚨 CRITICAL      : {result.get('critical', 0)}",
+            f"   🔴 HIGH          : {result.get('high', 0)}",
+            f"   🟡 MEDIUM        : {result.get('medium', 0)}",
+            f"   ⏱  Duration      : {result.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        sev_icons = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡"}
+        for f in result.get("findings", []):
+            icon = sev_icons.get(f.get("severity", ""), "❓")
+            lines.append(f"{icon} [{f['severity']}] {f['type']}")
+            lines.append(f"   Endpoint : {f.get('endpoint', '')[:90]}")
+            lines.append(f"   Origin   : {f.get('origin', '')}")
+            lines.append(f"   ACAO     : {f.get('acao', '')}")
+            lines.append(f"   ACAC     : {f.get('acac', '') or 'not set'}")
+            lines.append(f"   {f.get('description', '')}")
+            if f.get("poc"):
+                lines.append(f"   PoC      :\n     {f['poc'][:200]}")
+            lines.append("")
+
+        if not result.get("findings"):
+            lines.append("✅ No CORS misconfigurations detected.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🌐 CORS Test: {result.get('total_findings',0)} findings "
+            f"({result.get('critical',0)} CRITICAL) on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

