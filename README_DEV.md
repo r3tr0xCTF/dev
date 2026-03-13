@@ -2,11 +2,16 @@
 
 > Personal development branch of [HexStrike AI](https://github.com/0x4m4/hexstrike-ai) — a modular AI-powered penetration testing framework built on the MCP (Model Context Protocol) stack.
 >
-> This fork extends the original with a comprehensive offensive toolkit spanning the full pentest lifecycle: XSS C2 delivery, secret mining, authentication attacks, infrastructure analysis, and protocol-level exploitation.
+> This fork extends the original with a comprehensive offensive toolkit spanning the full pentest lifecycle: XSS C2 delivery, secret mining, authentication attacks, injection suites, infrastructure analysis, and protocol-level exploitation.
 
 ---
 
 ## What's New in This Fork
+
+### Claude Skill — hexstrike-jstap
+| Module | What it does |
+|---|---|
+| **hexstrike-jstap skill** | Single-prompt automation of the full JS-TAP pipeline — recon, XSS scan, C2 startup, tunnel, payload generation, injection, and beacon monitoring. Triggers on "test JS-TAP", "run xss chain against", "full XSS pipeline", and similar phrases. Stored in `skills/hexstrike-jstap/SKILL.md`. |
 
 ### XSS C2 Chain
 | Module | What it does |
@@ -54,9 +59,21 @@
 | **Business Logic Fuzzer** | Price/amount tampering, negative quantities, coupon abuse, workflow skipping, race conditions (N concurrent), parameter pollution, hidden params, mass assignment |
 | **WebSocket Security** | Endpoint discovery (17 paths), auth bypass (6 variants), origin validation/CSWSH, PoC generation, message injection (XSS/SQLi/cmd/SSTI/proto pollution), subprotocol abuse |
 
-### Reporting
+### Injection & Auth Attacks
 | Module | What it does |
 |---|---|
+| **SQL Injection Suite** | Error-based (6 DB engines), blind time-based, UNION extraction, NoSQL (MongoDB operator + auth bypass), optional sqlmap integration |
+| **File Upload Tester** | Extension bypass (PHP/ASP/JSP/Perl), MIME spoofing, GIF/PNG/JPEG polyglots, path traversal filenames, double extension, SVG XSS/SSRF |
+| **MFA Bypass Tester** | TOTP brute-force (0–9999), backup code spray, response manipulation, IP header bypass (X-Forwarded-For etc.), forced-browse MFA skip |
+| **IDOR/BOLA Scanner** | Horizontal ID range probing (query + path), vertical priv-esc (low-priv vs admin endpoints), unauthenticated access detection |
+| **SAML Attacker** | Unsigned assertion injection, XXE in SAML body, XML Signature Wrapping (XSW), assertion replay, attribute manipulation for admin escalation |
+
+### Findings & Reporting
+| Module | What it does |
+|---|---|
+| **Findings Database** | Persistent SQLite store for all scanner output; auto-dedup via SHA-256 hash; search by target/scanner/severity/type; JSON + CSV export |
+| **Host Header Injection** | Password reset poisoning, cache poisoning via injected Host, SSRF via X-Forwarded-Host to cloud metadata, internal service discovery, absolute URL reflection |
+| **HTML Report Generator** | Self-contained dark-theme HTML report with Chart.js severity donut, summary cards, full findings table; reads from FindingsDB or raw findings |
 | **Engagement Reporter** | Generates structured engagement reports from all findings |
 
 ---
@@ -171,6 +188,24 @@ target
 | `graphql_recon` | Full GraphQL recon: endpoint discovery, introspection, vuln checks |
 | `cache_poison` | Web cache poisoning: 7 techniques including unkeyed headers and deception |
 | `xxe_scan` | XXE injection: blind/OOB, DTD exfil, SVG/DOCX vectors, protocol handlers |
+| `host_header_inject` | Host header injection: reset poisoning, cache poison, SSRF, internal discovery |
+
+### Injection & Auth Bypass
+| Tool | Description |
+|---|---|
+| `sqli_scan` | SQL injection: error-based (6 DBs), blind time-based, UNION, NoSQL, sqlmap |
+| `upload_test` | File upload bypass: extension, MIME, polyglots, path traversal, SVG XSS |
+| `mfa_bypass` | MFA bypass: TOTP brute-force, backup codes, response manipulation, IP bypass |
+| `idor_scan` | IDOR/BOLA: horizontal ID probing, vertical priv-esc, unauthenticated access |
+| `saml_attack` | SAML attacks: unsigned assertion, XXE, XSW, replay, attribute manipulation |
+
+### Findings & Reporting
+| Tool | Description |
+|---|---|
+| `findings_store` | Store scanner findings to persistent SQLite DB with auto-dedup |
+| `findings_search` | Search findings DB by target, scanner, severity, or type |
+| `findings_export` | Export findings as JSON or CSV |
+| `report_html` | Generate self-contained dark-theme HTML report with Chart.js severity chart |
 
 ### Authentication & Token Attacks
 | Tool | Description |
@@ -294,9 +329,25 @@ python hexstrike_mcp.py
 
 ---
 
+## Claude Skills
+
+| Skill | Trigger phrases | Location |
+|---|---|---|
+| `hexstrike-jstap` | "test JS-TAP", "run xss chain against", "full XSS pipeline", "automate jstap", "hexstrike jstap" | `skills/hexstrike-jstap/SKILL.md` |
+
+Install by double-clicking `hexstrike-jstap.skill` or dragging it into Claude's skill manager.
+
+---
+
 ## Branch History
 
 ```
+51ba53b  feat: add hexstrike-jstap skill for automated JS-TAP XSS C2 workflow
+9db0cb8  feat: pipeline improvements — subdomain_enum in auto_recon, findings DB,
+                host header injection, HTML reports
+0c88d01  feat: SQL injection suite, file upload tester, MFA bypass,
+                IDOR/BOLA scanner, SAML attacks
+287cfdf  feat: subdomain enumeration pipeline, XXE scanner, updated README
 f4b9fc1  fix: use tempfile.gettempdir() instead of hardcoded /tmp (Windows compat)
 39799c5  feat: HTTP smuggling, business logic fuzzer, WebSocket security tester
 36d7565  feat: JWT attack suite and OAuth/OIDC misconfiguration tester
